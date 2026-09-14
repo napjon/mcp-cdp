@@ -10,7 +10,12 @@ POST_HEADERS = {
     "X-Requested-With": "mcp-cdp",
 }
 
-CSV = b"id,y,x\n00123,1,0.2\n00124,0,0.8\n00125,1,0.4\n00126,0,0.6\n"
+CSV = (
+    b"id,y,x\n"
+    b"00123,1,0.2\n00124,0,0.8\n00125,1,0.4\n00126,0,0.6\n"
+    b"00127,1,0.3\n00128,0,0.7\n00129,1,0.5\n00130,0,0.9\n"
+    b"00131,1,0.1\n00132,0,0.55\n"
+)
 
 
 def _dataset_and_model(client) -> tuple[str, str, str]:

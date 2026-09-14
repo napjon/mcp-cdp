@@ -227,6 +227,7 @@ def test_disclosure_preview_required_before_enable(client):
     body = preview.json()
     assert len(body["rows"]) <= 5
     assert body["previewed_at"]
+    assert body["enabled"] == 0
     enabled = client.put(
         f"/api/projects/local/datasets/{dataset_id}/disclosure",
         json={"enabled": True},
@@ -234,6 +235,12 @@ def test_disclosure_preview_required_before_enable(client):
     )
     assert enabled.status_code == 200, enabled.text
     assert enabled.json()["enabled"] == 1
+    preview_again = client.post(
+        f"/api/projects/local/datasets/{dataset_id}/disclosure/preview",
+        headers=POST_HEADERS,
+    )
+    assert preview_again.status_code == 200
+    assert preview_again.json()["enabled"] == 1
     off = client.put(
         f"/api/projects/local/datasets/{dataset_id}/disclosure",
         json={"enabled": False},

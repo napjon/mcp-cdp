@@ -58,9 +58,26 @@ def test_origin_allow_local_ui(client):
     assert response.json()["name"] == "Workspace two"
 
 
-def test_loopback_post_without_origin_allowed(client):
+def test_loopback_post_without_origin_or_requested_with_rejected(client):
     response = client.post("/api/projects", json={"name": "cli"})
+    assert response.status_code == 403
+    assert response.json()["error"] == "invalid origin"
+
+
+def test_originless_post_with_requested_with_allowed(client):
+    response = client.post(
+        "/api/projects",
+        json={"name": "cli"},
+        headers={"X-Requested-With": "mcp-cdp"},
+    )
     assert response.status_code == 200, response.text
+    assert response.json()["name"] == "cli"
+
+
+def test_mcp_mutating_skips_csrf_origin_check(client):
+    response = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+    assert response.status_code != 403
+    assert response.status_code == 401
 
 
 def test_default_project_exists(client):

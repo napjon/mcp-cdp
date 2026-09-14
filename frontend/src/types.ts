@@ -216,7 +216,7 @@ export type SubmitJobResponse = {
 
 export type SampleDisclosure = {
   dataset_id?: string
-  enabled: boolean
+  enabled: boolean | null
   previewed_at?: string | null
   columns?: string[]
   rows?: string[][] | Record<string, unknown>[]

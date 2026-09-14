@@ -12,7 +12,12 @@ POST_HEADERS = {
     "X-Requested-With": "mcp-cdp",
 }
 
-CSV = b"id,y,x\n00123,1,0.2\n00124,0,0.8\n00125,1,0.4\n00126,0,0.6\n"
+CSV = (
+    b"id,y,x\n"
+    b"00123,1,0.2\n00124,0,0.8\n00125,1,0.4\n00126,0,0.6\n"
+    b"00127,1,0.3\n00128,0,0.7\n00129,1,0.5\n00130,0,0.9\n"
+    b"00131,1,0.1\n00132,0,0.55\n"
+)
 
 
 def _dataset_and_experiment(client) -> tuple[str, str]:
@@ -496,3 +501,72 @@ def test_claim_next_job_atomic_one_running(db):
     assert running == 1
     assert queued == 4
     assert claimed[0]["status"] == "running"
+
+
+def test_two_attempts_do_not_share_artifact_dir(db):
+    from app.db import new_id
+    from app.worker import _build_call
+
+    job_id = new_id()
+    first, second = new_id(), new_id()
+    base = {
+        "id": job_id,
+        "type": "train",
+        "progress_json": "{}",
+        "experiment_revision_id": None,
+        "model_id": None,
+    }
+    _, paths_a = _build_call({**base, "attempt_id": first})
+    _, paths_b = _build_call({**base, "attempt_id": second})
+    dir_a = Path(paths_a["artifact_dir"])
+    dir_b = Path(paths_b["artifact_dir"])
+    assert dir_a != dir_b
+    assert dir_a.name == first
+    assert dir_b.name == second
+    assert dir_a.parent == dir_b.parent
+    assert dir_a.parent.name == job_id
+    assert dir_a.parent.parent.name == "artifacts"
+
+
+def test_enqueue_job_concurrent_respects_max_queue(db):
+    from app.db import get_db
+    from app.models import AppError
+    from app.services.jobs import enqueue_job
+    from app.settings import get_settings
+
+    max_queue = get_settings().max_queue
+    n_threads = max_queue * 3
+    barrier = threading.Barrier(n_threads, timeout=10)
+    accepted: list = []
+    rejected: list = []
+    errors: list = []
+
+    def _enqueue() -> None:
+        try:
+            barrier.wait()
+            accepted.append(enqueue_job("local", job_type="train"))
+        except AppError as exc:
+            if exc.code == "queue_full" and exc.status_code == 429:
+                rejected.append(exc)
+            else:
+                errors.append(exc)
+        except Exception as exc:  # noqa: BLE001 — surface thread failures in the parent
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_enqueue) for _ in range(n_threads)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+
+    assert errors == []
+    assert len(accepted) == max_queue
+    assert len(rejected) == n_threads - max_queue
+    with get_db() as conn:
+        queued = conn.execute(
+            "SELECT COUNT(*) AS c FROM jobs WHERE status = 'queued'"
+        ).fetchone()["c"]
+        total = conn.execute("SELECT COUNT(*) AS c FROM jobs").fetchone()["c"]
+    assert queued == max_queue
+    assert total == max_queue

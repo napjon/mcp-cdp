@@ -34,6 +34,7 @@ __all__ = [
     "NO_KEY_MESSAGE",
     "ChatClientIdConflict",
     "build_project_context",
+    "check_client_id_conflict",
     "create_conversation",
     "get_conversation",
     "get_sample_disclosure",
@@ -175,15 +176,43 @@ def resolve_user_message(conversation_id: str, content: str, client_id: str) -> 
         raise ChatClientIdConflict("client_id already used in another conversation") from exc
 
 
-def _assistant_after(conversation_id: str, user_created_at: str, user_id: str) -> dict[str, Any] | None:
+def check_client_id_conflict(conversation_id: str, client_id: str) -> None:
+    """Raise ChatClientIdConflict for leftover global UNIQUE without inserting."""
+    if _message_by_client_id(client_id, conversation_id):
+        return
+    other = fetchone(
+        "SELECT conversation_id FROM messages WHERE client_id = ?",
+        (client_id,),
+    )
+    if other is None or str(other["conversation_id"]) == conversation_id:
+        return
+    if _client_id_has_global_unique():
+        raise ChatClientIdConflict("client_id already used in another conversation")
+
+
+def _client_id_has_global_unique() -> bool:
+    for idx in fetchall("PRAGMA index_list(messages)"):
+        if not idx.get("unique"):
+            continue
+        name = idx.get("name")
+        if not isinstance(name, str) or not name.isidentifier():
+            continue
+        cols = [c.get("name") for c in fetchall(f"PRAGMA index_info({name})")]
+        if cols == ["client_id"]:
+            return True
+    return False
+
+
+def _assistant_after(conversation_id: str, user_id: str) -> dict[str, Any] | None:
     return fetchone(
         """
         SELECT id, conversation_id, role, content, client_id, status, provider, model, created_at
         FROM messages
-        WHERE conversation_id = ? AND role = 'assistant' AND (created_at > ? OR (created_at = ? AND id > ?))
+        WHERE conversation_id = ? AND role = 'assistant'
+          AND json_extract(usage_json, '$.parent_id') = ?
         ORDER BY created_at, id LIMIT 1
         """,
-        (conversation_id, user_created_at, user_created_at, user_id),
+        (conversation_id, user_id),
     )
 
 
@@ -196,6 +225,7 @@ def _insert_message(
     status: str,
     provider: str | None = None,
     model: str | None = None,
+    usage_json: str | None = None,
 ) -> dict[str, Any]:
     msg_id = _new_id()
     created = _now()
@@ -204,9 +234,9 @@ def _insert_message(
             """
             INSERT INTO messages (
                 id, conversation_id, role, content, client_id, status, provider, model, usage_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (msg_id, conversation_id, role, content, client_id, status, provider, model, created),
+            (msg_id, conversation_id, role, content, client_id, status, provider, model, usage_json, created),
         )
         conn.commit()
     return {
@@ -256,13 +286,12 @@ def _update_message(
         conn.commit()
 
 
-async def _lock_for(conversation_id: str, client_id: str) -> asyncio.Lock:
-    key = f"{conversation_id}:{client_id}"
+async def _lock_for(conversation_id: str) -> asyncio.Lock:
     async with _locks_guard:
-        lock = _locks.get(key)
+        lock = _locks.get(conversation_id)
         if lock is None:
             lock = asyncio.Lock()
-            _locks[key] = lock
+            _locks[conversation_id] = lock
         return lock
 
 
@@ -280,11 +309,16 @@ async def stream_user_message(
     if not conv:
         yield _sse({"type": "error", "message": "conversation not found"})
         return
-
-    lock = await _lock_for(conversation_id, client_id)
-    async with lock:
-        async for event in _stream_locked(conv, content, client_id, disconnected):
-            yield event
+    lock = await _lock_for(conversation_id)
+    inner = _stream_locked(conv, content, client_id, disconnected)
+    try:
+        async with lock:
+            async for event in inner:
+                yield event
+    finally:
+        close = getattr(inner, "aclose", None)
+        if close is not None:
+            await close()
 
 
 async def _stream_locked(
@@ -300,7 +334,7 @@ async def _stream_locked(
     except ChatClientIdConflict as exc:
         yield _sse({"type": "error", "message": str(exc), "status": "conflict"})
         return
-    assistant = _assistant_after(conversation_id, user_msg["created_at"], user_msg["id"])
+    assistant = _assistant_after(conversation_id, user_msg["id"])
     if assistant and assistant.get("status") == "complete":
         text = assistant.get("content") or ""
         if text:
@@ -311,18 +345,31 @@ async def _stream_locked(
         yield _sse({"type": "error", "message": "generation already in progress"})
         return
 
-    assistant = _insert_message(
-        conversation_id=conversation_id,
-        role="assistant",
-        content="",
-        client_id=None,
-        status="streaming",
-        provider=llm_provider_name() if llm_configured() else None,
-        model=_active_model() if llm_configured() else None,
-    )
+    usage_out: dict[str, Any] = {"parent_id": user_msg["id"]}
+    provider = llm_provider_name() if llm_configured() else None
+    model = _active_model() if llm_configured() else None
+    if assistant is None:
+        assistant = _insert_message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content="",
+            client_id=None,
+            status="streaming",
+            provider=provider,
+            model=model,
+            usage_json=_usage_json(usage_out),
+        )
+    else:
+        _update_message(
+            assistant["id"],
+            content="",
+            status="streaming",
+            provider=provider,
+            model=model,
+            usage_json=_usage_json(usage_out),
+        )
     chunks: list[str] = []
     status = "complete"
-    usage_out: dict[str, Any] = {}
     try:
         async for token in iter_assistant_tokens(
             project_id,
@@ -348,7 +395,7 @@ async def _stream_locked(
             yield _sse({"type": "error", "message": "interrupted", "status": "interrupted"})
             return
         yield _sse({"type": "done", "status": "complete"})
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, GeneratorExit):
         _update_message(
             assistant["id"],
             content="".join(chunks),

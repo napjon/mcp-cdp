@@ -8,6 +8,17 @@ POST_HEADERS = {
 }
 
 TWO_CLASS_CSV = b"id,y,x\n1,yes,0.1\n2,no,0.2\n3,yes,0.3\n4,no,0.4\n"
+BALANCED_CLASS_CSV = (
+    b"id,y,x\n"
+    b"1,yes,0.1\n2,yes,0.2\n3,yes,0.3\n4,yes,0.4\n5,yes,0.5\n"
+    b"6,no,0.6\n7,no,0.7\n8,no,0.8\n9,no,0.9\n10,no,1.0\n"
+)
+TINY_STRATIFY_CSV = (
+    b"id,y,x\n"
+    b"1,yes,0.1\n2,yes,0.2\n3,yes,0.3\n4,yes,0.4\n"
+    b"5,yes,0.5\n6,yes,0.6\n7,yes,0.7\n8,yes,0.8\n"
+    b"9,no,0.9\n10,no,1.0\n"
+)
 SINGLE_CLASS_CSV = b"id,y,x\n1,yes,0.1\n2,yes,0.2\n3,yes,0.3\n"
 WEAK_CLASS_CSV = b"id,y,x\n1,yes,0.1\n2,yes,0.2\n3,no,0.3\n"
 
@@ -99,7 +110,7 @@ def test_validate_config_rejects_unknown_split(client):
     from app.services.datasets import get_dataset
     from app.services.experiments import validate_config
 
-    dataset_id = _upload(client, "split.csv", TWO_CLASS_CSV)
+    dataset_id = _upload(client, "split.csv", BALANCED_CLASS_CSV)
     dataset = get_dataset("local", dataset_id)
     with pytest.raises(AppError, match="invalid split"):
         validate_config(
@@ -136,6 +147,42 @@ def test_validate_config_rejects_unknown_split(client):
         dataset,
     )
     assert ok["split"] == "random"
+
+
+def test_validate_config_rejects_infeasible_classification_split(client):
+    from app.models import AppError
+    from app.services.datasets import get_dataset
+    from app.services.experiments import validate_config
+
+    tiny_id = _upload(client, "sklearn-tiny.csv", TWO_CLASS_CSV)
+    tiny = get_dataset("local", tiny_id)
+    with pytest.raises(AppError) as tiny_exc:
+        validate_config(
+            {"task": "classification", "target": "y", "features": ["x"]},
+            tiny,
+        )
+    assert tiny_exc.value.code == "infeasible_split"
+
+    dataset_id = _upload(client, "tiny-split.csv", TINY_STRATIFY_CSV)
+    dataset = get_dataset("local", dataset_id)
+    before = _job_count()
+    with pytest.raises(AppError) as exc:
+        validate_config(
+            {"task": "classification", "target": "y", "features": ["x"]},
+            dataset,
+        )
+    assert exc.value.code == "infeasible_split"
+    blocked = client.post(
+        "/api/projects/local/experiments",
+        json={
+            "dataset_id": dataset_id,
+            "config": {"task": "classification", "target": "y", "features": ["x"]},
+        },
+        headers=POST_HEADERS,
+    )
+    assert blocked.status_code == 400
+    assert blocked.json()["code"] == "infeasible_split"
+    assert _job_count() == before
 
 
 FORECAST_CSV = b"date,sales,sku\n2024-01-01,10,A\n2024-01-02,11,A\n2024-01-03,12,A\n"

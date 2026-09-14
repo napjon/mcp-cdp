@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.db import init_db
+from app.lifecycle import maybe_run_retention, start_retention_loop
 from app.models import AppError
 from app.services.security import check_mutating_request, redact_secrets
 from app.settings import get_settings
@@ -31,6 +32,8 @@ def create_app(*, worker_enabled: bool | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         init_db()
+        maybe_run_retention()
+        retention_stop, retention_thread = start_retention_loop()
         worker = Worker()
         app.state.worker = worker
         if worker_enabled:
@@ -41,6 +44,8 @@ def create_app(*, worker_enabled: bool | None = None) -> FastAPI:
                     await stack.enter_async_context(hook)
                 yield
         finally:
+            retention_stop.set()
+            retention_thread.join(timeout=1)
             worker.stop()
 
     application = FastAPI(title="mcp-cdp", lifespan=lifespan)

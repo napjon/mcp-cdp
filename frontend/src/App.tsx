@@ -133,6 +133,8 @@ export default function App() {
   const [state, dispatch] = useReducer(reducer, undefined, initialState)
   const abortRef = useRef<AbortController | null>(null)
   const hydratedRef = useRef(false)
+  const dataUploadingRef = useRef(false)
+  const dataRequestRef = useRef(0)
   const [columnsError, setColumnsError] = useState<string | null>(null)
   const trainSuccessRef = useRef<(job: Job) => void>(() => {})
   const predictSuccessRef = useRef<(job: Job) => void>(() => {})
@@ -248,6 +250,7 @@ export default function App() {
           if (!cancelled) {
             dispatch({ type: 'SET_CONVERSATION', conversationId })
             dispatch({ type: 'LOAD_MESSAGES', messages })
+            patchPersist({ conversationId })
           }
         } catch {
           conversationId = null
@@ -256,7 +259,11 @@ export default function App() {
       if (!conversationId) {
         try {
           const conversation = await createConversation(project.id)
-          if (!cancelled) dispatch({ type: 'SET_CONVERSATION', conversationId: conversation.id })
+          conversationId = conversation.id
+          if (!cancelled) {
+            dispatch({ type: 'SET_CONVERSATION', conversationId })
+            patchPersist({ conversationId })
+          }
         } catch {
           /* Chat is optional; cards still work. */
         }
@@ -283,7 +290,10 @@ export default function App() {
         await restoreRun(project.id, saved, () => cancelled, dispatch)
       }
 
-      if (!cancelled) hydratedRef.current = true
+      if (!cancelled) {
+        hydratedRef.current = true
+        patchPersist({ conversationId, projectId: project.id })
+      }
     }
     void boot()
     return () => {
@@ -295,17 +305,23 @@ export default function App() {
   useJobWatcher(state.project?.id, state.predictJob, 'predict', dispatch, predictSuccessRef)
 
   async function ingestDataset(loader: () => Promise<DatasetDetail>) {
+    if (dataUploadingRef.current || state.dataBusy) return
     if (!state.project?.id) {
       dispatch({ type: 'DATA_ERROR', error: 'The local app is not reachable yet.' })
       return
     }
-    dispatch({ type: 'DATA_BUSY', busy: true })
+    dataUploadingRef.current = true
+    const requestId = ++dataRequestRef.current
     dispatch({ type: 'DATA_ERROR', error: null })
+    dispatch({ type: 'DATA_BUSY', busy: true })
     setColumnsError(null)
     try {
       const uploaded = await loader()
+      if (requestId !== dataRequestRef.current) return
       const dataset = await getDataset(state.project.id, uploaded.id).catch(() => uploaded)
+      if (requestId !== dataRequestRef.current) return
       const preview = await getPreview(state.project.id, dataset.id, 20).catch(() => null)
+      if (requestId !== dataRequestRef.current) return
       dispatch({
         type: 'DATA_LOADED',
         dataset,
@@ -313,7 +329,10 @@ export default function App() {
         columns: columnsFromDataset(dataset, preview),
       })
     } catch (err) {
+      if (requestId !== dataRequestRef.current) return
       dispatch({ type: 'DATA_ERROR', error: plainError(err) })
+    } finally {
+      if (requestId === dataRequestRef.current) dataUploadingRef.current = false
     }
   }
 
@@ -331,6 +350,7 @@ export default function App() {
         const conversation = await createConversation(state.project.id)
         conversationId = conversation.id
         dispatch({ type: 'SET_CONVERSATION', conversationId })
+        patchPersist({ conversationId })
       } catch {
         conversationId = null
       }
@@ -525,12 +545,14 @@ export default function App() {
               >
                 {item.card === 'data' ? (
                   <DataCard
+                    key={`${state.project?.id ?? 'none'}:${state.dataset?.id ?? 'empty'}`}
                     projectId={state.project?.id ?? ''}
                     dataset={state.dataset}
                     preview={state.preview}
                     busy={state.dataBusy}
                     error={state.dataError}
                     onUpload={(file) => {
+                      if (state.dataBusy) return
                       void ingestDataset(() => uploadCsv(state.project!.id, file))
                     }}
                     onSheet={(url, headerRow) => {

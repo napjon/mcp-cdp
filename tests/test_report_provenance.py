@@ -114,6 +114,32 @@ def test_train_report_includes_provenance_and_dummy_baseline(db, tmp_path: Path)
     assert "test" not in report["baseline_metrics"]
 
 
+def test_train_report_preserves_canonical_baseline_bags(db, tmp_path: Path):
+    ids = _seed_train_job(
+        {"task": "regression", "target": "y", "features": ["x"], "split": "random"}
+    )
+    baseline = {
+        "family": "dummy",
+        "validation": {"mae": 2.0, "rmse": 2.2},
+        "test": {"mae": 2.5, "rmse": 2.7},
+    }
+    result = {
+        "metrics": {
+            "task": "regression",
+            "test": {"mae": 1.0, "rmse": 1.1},
+            "validation": {"mae": 1.2, "rmse": 1.3},
+            "baseline": baseline,
+            "y_true": [1.0, 2.0],
+        },
+        "selected_candidate": "linear",
+        "warnings": [],
+        "plot_files": [],
+    }
+    _store_train_result(_job_dict(ids), {"artifact_dir": str(tmp_path / "canonical")}, result)
+    report = _read_report(ids["job_id"])
+    assert report["baseline_metrics"] == baseline
+
+
 def test_regression_report_units_from_config_or_default(db, tmp_path: Path):
     labeled = _seed_train_job(
         {

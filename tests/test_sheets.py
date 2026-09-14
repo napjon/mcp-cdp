@@ -245,7 +245,11 @@ def test_sheets_preview_does_not_persist(mock_client, client):
 @patch("app.services.sheets.httpx.Client")
 def test_schema_change_sets_needs_review_same_schema_does_not(mock_client, client):
     inst = mock_client.return_value
-    original = b"id,y,x\n1,yes,0.1\n2,no,0.2\n3,yes,0.3\n4,no,0.4\n"
+    original = (
+        b"id,y,x\n"
+        b"1,yes,0.1\n2,no,0.2\n3,yes,0.3\n4,no,0.4\n5,yes,0.5\n"
+        b"6,no,0.6\n7,yes,0.7\n8,no,0.8\n9,yes,0.9\n10,no,1.0\n"
+    )
     inst.get.return_value = FakeResponse(content=original)
     created = client.post(
         "/api/projects/local/datasets/sheets",
@@ -268,7 +272,11 @@ def test_schema_change_sets_needs_review_same_schema_does_not(mock_client, clien
     assert exp.status_code == 200, exp.text
     experiment_id = exp.json()["id"]
 
-    same_schema = b"id,y,x\n5,yes,0.5\n6,no,0.6\n7,yes,0.7\n8,no,0.8\n"
+    same_schema = (
+        b"id,y,x\n"
+        b"11,yes,1.1\n12,no,1.2\n13,yes,1.3\n14,no,1.4\n15,yes,1.5\n"
+        b"16,no,1.6\n17,yes,1.7\n18,no,1.8\n19,yes,1.9\n20,no,2.0\n"
+    )
     inst.get.return_value = FakeResponse(content=same_schema)
     refreshed = client.post(
         f"/api/projects/local/sheet-connections/{connection_id}/refresh",
@@ -278,7 +286,11 @@ def test_schema_change_sets_needs_review_same_schema_does_not(mock_client, clien
     assert refreshed.json()["unchanged"] is False
     assert int(refreshed.json().get("needs_review") or 0) == 0
 
-    changed = b"id,y,x,extra\n1,yes,0.1,z\n2,no,0.2,z\n3,yes,0.3,z\n4,no,0.4,z\n"
+    changed = (
+        b"id,y,x,extra\n"
+        b"1,yes,0.1,z\n2,no,0.2,z\n3,yes,0.3,z\n4,no,0.4,z\n5,yes,0.5,z\n"
+        b"6,no,0.6,z\n7,yes,0.7,z\n8,no,0.8,z\n9,yes,0.9,z\n10,no,1.0,z\n"
+    )
     inst.get.return_value = FakeResponse(content=changed)
     schema = client.post(
         f"/api/projects/local/sheet-connections/{connection_id}/refresh",
@@ -314,7 +326,11 @@ def test_schema_change_sets_needs_review_same_schema_does_not(mock_client, clien
     assert int(reviewed.json().get("needs_review") or 0) == 0
 
     inst.get.return_value = FakeResponse(
-        content=b"id,y,x,other\n1,yes,0.1,z\n2,no,0.2,z\n3,yes,0.3,z\n4,no,0.4,z\n"
+        content=(
+            b"id,y,x,other\n"
+            b"1,yes,0.1,z\n2,no,0.2,z\n3,yes,0.3,z\n4,no,0.4,z\n5,yes,0.5,z\n"
+            b"6,no,0.6,z\n7,yes,0.7,z\n8,no,0.8,z\n9,yes,0.9,z\n10,no,1.0,z\n"
+        )
     )
     again = client.post(
         f"/api/projects/local/sheet-connections/{connection_id}/refresh",
@@ -337,3 +353,90 @@ def test_schema_change_sets_needs_review_same_schema_does_not(mock_client, clien
         headers=POST_HEADERS,
     )
     assert ok.status_code == 200, ok.text
+
+
+@patch("app.services.sheets.httpx.Client")
+def test_refresh_type_change_sets_needs_review_and_preserves_user_role(mock_client, client):
+    inst = mock_client.return_value
+    numeric = b"id,amount\n1,10\n2,20\n3,30\n4,40\n"
+    inst.get.return_value = FakeResponse(content=numeric)
+    created = client.post(
+        "/api/projects/local/datasets/sheets",
+        json={"url": "https://docs.google.com/spreadsheets/d/TYPECHANGE1/edit#gid=0"},
+        headers=POST_HEADERS,
+    )
+    assert created.status_code == 200, created.text
+    dataset_id = created.json()["id"]
+    connection_id = created.json()["connection_id"]
+    amount = next(c for c in created.json()["columns"] if c["name"] == "amount")
+    assert amount["inferred_role"] == "numeric"
+
+    reviewed = client.put(
+        f"/api/projects/local/datasets/{dataset_id}/columns",
+        json={"columns": [{"name": "amount", "role": "numeric"}]},
+        headers=POST_HEADERS,
+    )
+    assert reviewed.status_code == 200, reviewed.text
+    assert (
+        next(c for c in reviewed.json()["columns"] if c["name"] == "amount")["user_role"]
+        == "numeric"
+    )
+
+    same_types = b"id,amount\n5,50\n6,60\n7,70\n8,80\n"
+    inst.get.return_value = FakeResponse(content=same_types)
+    copied = client.post(
+        f"/api/projects/local/sheet-connections/{connection_id}/refresh",
+        headers=POST_HEADERS,
+    )
+    assert copied.status_code == 200, copied.text
+    assert int(copied.json().get("needs_review") or 0) == 0
+    copied_amount = next(c for c in copied.json()["columns"] if c["name"] == "amount")
+    assert copied_amount["user_role"] == "numeric"
+    assert copied_amount["inferred_role"] == "numeric"
+
+    as_text = b"id,amount\n1,ten\n2,twenty\n3,thirty\n4,forty\n"
+    inst.get.return_value = FakeResponse(content=as_text)
+    drifted = client.post(
+        f"/api/projects/local/sheet-connections/{connection_id}/refresh",
+        headers=POST_HEADERS,
+    )
+    assert drifted.status_code == 200, drifted.text
+    assert int(drifted.json().get("needs_review") or 0) == 1
+    drifted_amount = next(c for c in drifted.json()["columns"] if c["name"] == "amount")
+    assert drifted_amount["inferred_role"] == "text"
+
+
+@patch("app.services.sheets.httpx.Client")
+def test_refresh_semantic_role_change_sets_needs_review(mock_client, client):
+    inst = mock_client.return_value
+    categorical = (
+        b"id,status\n"
+        b"1,new\n2,new\n3,new\n4,new\n5,new\n"
+        b"6,done\n7,done\n8,done\n9,done\n10,done\n"
+    )
+    inst.get.return_value = FakeResponse(content=categorical)
+    created = client.post(
+        "/api/projects/local/datasets/sheets",
+        json={"url": "https://docs.google.com/spreadsheets/d/SEMANTIC1/edit#gid=0"},
+        headers=POST_HEADERS,
+    )
+    assert created.status_code == 200, created.text
+    connection_id = created.json()["connection_id"]
+    status = next(c for c in created.json()["columns"] if c["name"] == "status")
+    assert status["inferred_role"] == "categorical"
+
+    text = (
+        b"id,status\n"
+        b"1,awaiting approval\n2,shipped to customer\n3,returned\n4,backordered\n"
+        b"5,delayed at port\n6,ready for pickup\n7,customs hold\n8,damaged in transit\n"
+        b"9,delivered\n10,cancelled by buyer\n"
+    )
+    inst.get.return_value = FakeResponse(content=text)
+    refreshed = client.post(
+        f"/api/projects/local/sheet-connections/{connection_id}/refresh",
+        headers=POST_HEADERS,
+    )
+    assert refreshed.status_code == 200, refreshed.text
+    assert int(refreshed.json().get("needs_review") or 0) == 1
+    refreshed_status = next(c for c in refreshed.json()["columns"] if c["name"] == "status")
+    assert refreshed_status["inferred_role"] == "text"

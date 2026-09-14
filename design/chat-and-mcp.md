@@ -67,11 +67,16 @@ Table `sample_disclosure(dataset_id PK, enabled, previewed_at)`:
 
 Eval questions 75–76, 79, and 90 rest on this policy. Metric claims in chat must cite persisted reports; missing evidence is stated as missing, never invented.
 
-### Contract gap (do not fork a second API)
+### REST (sample disclosure)
 
-[CONTRACT.md](CONTRACT.md) locks the `sample_disclosure` table and the summaries-only default. It does **not** list a REST path or an MCP tool that writes that table. Implementers must not invent a parallel table or a second policy.
+[CONTRACT.md](CONTRACT.md) locks the `sample_disclosure` table, the summaries-only default, and these routes:
 
-Until CONTRACT is opened to add a route, Chat+MCP owns a **domain service** that reads/writes `sample_disclosure` (preview required before `enabled=1`). The Data card and in-app chat call that service in-process. MCP clients have no listed write tool for disclosure; they keep summaries-only unless the operator already enabled it in the UI. Adding `PUT /api/projects/{id}/datasets/{id}/sample-disclosure` (or an MCP tool) is a contract amendment, not a design-only endpoint.
+| Method | Path | Body / result |
+|---|---|---|
+| POST | `/api/projects/{project_id}/datasets/{dataset_id}/disclosure/preview` | Records `previewed_at`. Returns a bounded sample (≤5 rows) for the Data card. Does not set `enabled=1`. |
+| PUT | `/api/projects/{project_id}/datasets/{dataset_id}/disclosure` | `{enabled: bool}`. Enable is rejected until a preview has been recorded. Disable applies to later chat and MCP requests immediately. |
+
+The Data card calls these routes. Chat and MCP tools read the same `sample_disclosure` row. MCP has no write tool for disclosure; clients stay summaries-only unless the operator already enabled sharing in the UI. Do not invent a parallel table, a second policy, or a different path (for example `.../sample-disclosure`).
 
 ## Tool policy (in-app chat)
 

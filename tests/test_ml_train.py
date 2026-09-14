@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.base import clone
 from sklearn.metrics import (
     balanced_accuracy_score,
     f1_score,
@@ -15,8 +16,6 @@ from sklearn.metrics import (
     mean_squared_error,
     r2_score,
 )
-
-from sklearn.base import clone
 from sklearn.pipeline import Pipeline
 
 from app.ml.preprocess import (
@@ -423,3 +422,134 @@ def test_linear_pipeline_has_scaler_dummy_and_xgb_do_not():
             assert found["xgboost"] is False
         else:
             assert "xgboost" not in found
+
+
+CLS_BAG_KEYS = ("macro_f1", "balanced_accuracy")
+REG_BAG_KEYS = ("mae", "rmse", "r2")
+
+
+def _assert_bag(bag: dict, keys: tuple[str, ...]) -> None:
+    assert isinstance(bag, dict)
+    for key in keys:
+        assert key in bag
+
+
+def test_selected_and_dummy_nested_metric_bags(tmp_path: Path):
+    csv_path = tmp_path / "cls.csv"
+    _cls_frame().to_csv(csv_path, index=False)
+    result = run_train(
+        _train_job(csv_path, "classification"), {"artifact_dir": str(tmp_path / "art")}
+    )
+    metrics = result["metrics"]
+    dummy = metrics["candidates"]["dummy"]
+    selected = metrics["candidates"][result["selected_candidate"]]
+    _assert_bag(metrics["test"], CLS_BAG_KEYS)
+    _assert_bag(metrics["validation"], CLS_BAG_KEYS)
+    _assert_bag(dummy["test"], CLS_BAG_KEYS)
+    _assert_bag(dummy["validation"], CLS_BAG_KEYS)
+    _assert_bag(selected["test"], CLS_BAG_KEYS)
+    _assert_bag(selected["validation"], CLS_BAG_KEYS)
+    baseline = metrics["baseline"]
+    assert baseline["family"] == "dummy"
+    _assert_bag(baseline["test"], CLS_BAG_KEYS)
+    _assert_bag(baseline["validation"], CLS_BAG_KEYS)
+    if result["selected_candidate"] != "dummy":
+        assert dummy["test"] != metrics["validation"]
+
+    csv_reg = tmp_path / "reg.csv"
+    _reg_frame().to_csv(csv_reg, index=False)
+    reg = run_train(_train_job(csv_reg, "regression"), {"artifact_dir": str(tmp_path / "art-reg")})
+    rmetrics = reg["metrics"]
+    rdummy = rmetrics["candidates"]["dummy"]
+    _assert_bag(rmetrics["test"], REG_BAG_KEYS)
+    _assert_bag(rmetrics["validation"], REG_BAG_KEYS)
+    _assert_bag(rdummy["test"], REG_BAG_KEYS)
+    _assert_bag(rdummy["validation"], REG_BAG_KEYS)
+    assert rmetrics["baseline"]["family"] == "dummy"
+
+
+def test_dummy_beats_terrible_model_comparable_keys(tmp_path: Path, monkeypatch):
+    from sklearn.base import BaseEstimator, ClassifierMixin
+    from sklearn.dummy import DummyClassifier
+
+    from app.ml.classify import Candidate
+
+    class TerribleClassifier(BaseEstimator, ClassifierMixin):
+        def fit(self, X, y):
+            self.classes_ = np.unique(np.asarray(y).astype(str))
+            return self
+
+        def predict(self, X):
+            n = int(getattr(X, "shape", [len(X)])[0])
+            return np.full(n, "__terrible__", dtype=object)
+
+    def fake_iter(budget, seed):
+        return [
+            Candidate(
+                family="dummy",
+                name="dummy",
+                estimator=DummyClassifier(strategy="most_frequent"),
+                scale_numeric=False,
+                params={"strategy": "most_frequent"},
+            ),
+            Candidate(
+                family="linear",
+                name="linear",
+                estimator=TerribleClassifier(),
+                scale_numeric=False,
+                params={},
+            ),
+        ]
+
+    monkeypatch.setattr("app.ml.classify.iter_candidates", fake_iter)
+    csv_path = tmp_path / "cls.csv"
+    _cls_frame(n=40).to_csv(csv_path, index=False)
+    result = run_train(
+        _train_job(csv_path, "classification"), {"artifact_dir": str(tmp_path / "art")}
+    )
+    metrics = result["metrics"]
+    dummy = metrics["candidates"]["dummy"]
+    selected = metrics["candidates"][result["selected_candidate"]]
+    assert dummy["status"] == "ok"
+    assert dummy["validation"]["macro_f1"] >= selected["validation"]["macro_f1"]
+    assert set(dummy["test"]) >= set(CLS_BAG_KEYS)
+    assert set(selected["test"]) >= set(CLS_BAG_KEYS)
+    assert set(dummy["validation"]) == set(selected["validation"])
+    assert set(dummy["test"]) == set(selected["test"])
+
+
+def test_deadline_skips_extra_candidates(tmp_path: Path, monkeypatch):
+    import time
+
+    from app.ml import classify, runner
+
+    monkeypatch.setattr(runner, "_budget_deadline", lambda budget: time.monotonic() - 1)
+    csv_path = tmp_path / "cls.csv"
+    _cls_frame().to_csv(csv_path, index=False)
+    result = run_train(
+        _train_job(csv_path, "classification"), {"artifact_dir": str(tmp_path / "art")}
+    )
+    cands = result["metrics"]["candidates"]
+    assert cands["dummy"]["status"] == "ok"
+    assert cands["linear"]["status"] == "skipped"
+    if classify.HAS_XGBOOST:
+        assert cands["xgboost"]["status"] == "skipped"
+    else:
+        assert cands["xgboost"]["status"] == "failed"
+    assert result["selected_candidate"] == "dummy"
+    assert any("time budget exhausted" in w for w in result["warnings"])
+
+
+def test_classification_split_feasible():
+    from app.ml.preprocess import classification_split_feasible
+
+    assert classification_split_feasible(100, 2, 0.2, 2) is True
+    assert classification_split_feasible(40, 3, 0.2, 2) is True
+    assert classification_split_feasible(3, 2, 0.2, 2) is False
+    assert classification_split_feasible(10, 1, 0.2, 2) is False
+    assert classification_split_feasible(8, 2, 0.5, 2) is False
+    assert classification_split_feasible(4, 2, 0.2, 2) is False
+    assert classification_split_feasible(20, 2, 0.2, 2) is True
+    assert classification_split_feasible({"yes": 2, "no": 2}, test_size=0.2) is True
+    assert classification_split_feasible({"yes": 5, "no": 5}, 0.2) is True
+    assert classification_split_feasible({"yes": 8, "no": 2}, test_size=0.2) is False

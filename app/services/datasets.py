@@ -647,7 +647,15 @@ def preview_disclosure(project_id: str, dataset_id: str) -> dict:
             """,
             (dataset_id, now),
         )
+        row = conn.execute(
+            "SELECT dataset_id, enabled, previewed_at FROM sample_disclosure WHERE dataset_id = ?",
+            (dataset_id,),
+        ).fetchone()
     payload["previewed_at"] = now
+    if row is not None:
+        payload["dataset_id"] = row["dataset_id"]
+        payload["enabled"] = bool(row["enabled"])
+        payload["previewed_at"] = row["previewed_at"]
     payload["ok"] = True
     payload["sample_rows"] = len(payload.get("rows") or [])
     return payload

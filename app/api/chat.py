@@ -12,14 +12,24 @@ from pydantic import BaseModel, Field
 from app.mcp.config import redact
 from app.services.chat import (
     ChatClientIdConflict,
+    check_client_id_conflict,
     create_conversation,
     get_conversation,
     list_messages,
-    resolve_user_message,
     stream_user_message,
 )
 
 router = APIRouter(prefix="/api", tags=["chat"])
+
+
+class _ChatStreamingResponse(StreamingResponse):
+    async def stream_response(self, send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            close = getattr(self.body_iterator, "aclose", None)
+            if close is not None:
+                await close()
 
 
 class CreateConversationIn(BaseModel):
@@ -59,20 +69,26 @@ async def post_message(
     if not conv:
         raise HTTPException(status_code=404, detail="conversation not found")
     try:
-        resolve_user_message(conversation_id, body.content, body.client_id)
+        check_client_id_conflict(conversation_id, body.client_id)
     except ChatClientIdConflict as exc:
         raise HTTPException(status_code=409, detail=redact(str(exc))) from exc
 
     async def events() -> AsyncIterator[str]:
-        async for event in stream_user_message(
+        agen = stream_user_message(
             conversation_id,
             body.content,
             body.client_id,
             disconnected=request.is_disconnected,
-        ):
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        )
+        try:
+            async for event in agen:
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        finally:
+            close = getattr(agen, "aclose", None)
+            if close is not None:
+                await close()
 
-    return StreamingResponse(
+    return _ChatStreamingResponse(
         events(),
         media_type="text/event-stream",
         headers={

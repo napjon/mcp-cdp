@@ -337,7 +337,7 @@ def refresh_sheet(project_id: str, connection_id: str, *, header_row: int | None
             ).fetchone()
         )
         previous_version_id = connection.get("last_version_id")
-        prev_names: list[str] | None = None
+        prev_cols: list[dict] | None = None
         if dataset_row is not None:
             latest = conn.execute(
                 """
@@ -347,10 +347,13 @@ def refresh_sheet(project_id: str, connection_id: str, *, header_row: int | None
                 (dataset_row["id"],),
             ).fetchone()
             if latest:
-                prev_names = [
-                    r["name"]
+                prev_cols = [
+                    row_dict(r)
                     for r in conn.execute(
-                        "SELECT name FROM columns WHERE version_id = ? ORDER BY rowid",
+                        """
+                        SELECT name, inferred_role, user_role
+                        FROM columns WHERE version_id = ? ORDER BY rowid
+                        """,
                         (latest["id"],),
                     ).fetchall()
                 ]
@@ -401,12 +404,6 @@ def refresh_sheet(project_id: str, connection_id: str, *, header_row: int | None
         changed = add_dataset_version(
             conn, project_id=project_id, dataset_id=dataset_id, table=table
         )
-        if (
-            changed is not None
-            and prev_names is not None
-            and list(table.headers) != list(prev_names)
-        ):
-            _set_needs_review(conn, dataset_id, 1)
         latest = conn.execute(
             """
             SELECT id FROM dataset_versions WHERE dataset_id = ?
@@ -414,6 +411,14 @@ def refresh_sheet(project_id: str, connection_id: str, *, header_row: int | None
             """,
             (dataset_id,),
         ).fetchone()
+        if changed is not None and prev_cols is not None and latest is not None:
+            _apply_refresh_roles(
+                conn,
+                dataset_id=dataset_id,
+                new_version_id=latest["id"],
+                prev_cols=prev_cols,
+                new_stats=table.column_stats,
+            )
         conn.execute(
             """
             UPDATE sheet_connections
@@ -427,6 +432,47 @@ def refresh_sheet(project_id: str, connection_id: str, *, header_row: int | None
         payload = get_dataset(project_id, dataset_id, conn=conn)
         payload["unchanged"] = changed is None
         return payload
+
+
+def _type_family(role: str | None) -> str:
+    r = (role or "").strip().lower()
+    # Keep categorical/text/identifier/constant distinct: each changes how
+    # feature selection and preprocessing interpret a refreshed column.
+    if r in {"numeric", "date", "categorical", "text", "identifier", "constant"}:
+        return r
+    return "text"
+
+
+def _apply_refresh_roles(
+    conn,
+    *,
+    dataset_id: str,
+    new_version_id: str,
+    prev_cols: list[dict],
+    new_stats: list[dict],
+) -> None:
+    prev_by_name = {c["name"]: c for c in prev_cols}
+    prev_names = [c["name"] for c in prev_cols]
+    new_names = [c["name"] for c in new_stats]
+    needs_review = list(new_names) != list(prev_names)
+    for col in new_stats:
+        name = col.get("name")
+        prev = prev_by_name.get(name)
+        if prev is None:
+            needs_review = True
+            continue
+        new_inferred = col.get("inferred_role")
+        old_inferred = prev.get("inferred_role")
+        if _type_family(new_inferred) != _type_family(old_inferred):
+            needs_review = True
+        user_role = prev.get("user_role")
+        if user_role:
+            conn.execute(
+                "UPDATE columns SET user_role = ? WHERE version_id = ? AND name = ?",
+                (user_role, new_version_id, name),
+            )
+    if needs_review:
+        _set_needs_review(conn, dataset_id, 1)
 
 
 def _mark_connection(

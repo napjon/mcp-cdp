@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 
@@ -211,6 +212,47 @@ def _check_classification_target(config: dict, version: dict) -> None:
             "each class needs at least 2 rows; insufficient support: " + ", ".join(weak),
             code="insufficient_class_support",
         )
+    split = str(config.get("split") or "random").strip().lower()
+    if split in {"random", "stratified"}:
+        try:
+            test_size = float(config.get("test_size", 0.2))
+        except (TypeError, ValueError):
+            test_size = 0.2
+        if not classification_split_feasible(counts, test_size=test_size):
+            raise AppError(
+                "this classification split cannot keep at least one row of each class in the test set",
+                code="infeasible_split",
+            )
+
+
+def classification_split_feasible(counts: dict[str, int], test_size: float = 0.2) -> bool:
+    n = sum(int(c) for c in counts.values())
+    n_classes = len(counts)
+    if n_classes < 2 or n <= 0:
+        return False
+    try:
+        test_size_f = float(test_size)
+    except (TypeError, ValueError):
+        return False
+    helper = None
+    try:
+        from app.ml.preprocess import classification_split_feasible as helper
+    except ImportError:
+        helper = None
+    if callable(helper):
+        try:
+            if not helper(n, n_classes, test_size_f, MIN_CLASS_SUPPORT):
+                return False
+        except TypeError:
+            pass
+    if not 0.0 < test_size_f < 1.0:
+        return False
+    n_test = min(n - 1, max(1, math.ceil(test_size_f * n - 1e-12)))
+    for count in counts.values():
+        # A class with 2 rows in n=10 at test_size=0.2 gets ~0.4 test rows.
+        if (n_test * int(count)) / n < 0.5:
+            return False
+    return True
 
 
 def create_experiment(project_id: str, dataset_id: str, config: dict) -> dict:

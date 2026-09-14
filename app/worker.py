@@ -130,12 +130,57 @@ class Worker:
             )
         finally:
             hb_stop.set()
-            attach_job_process(job_id, None)
+            attach_job_process(job_id, None, attempt_id=attempt_id)
+
+
+def _attempt_artifact_dir(job: dict) -> Path:
+    settings = get_settings()
+    attempt_id = job.get("attempt_id")
+    if not attempt_id:
+        return settings.artifacts_dir / job["id"]
+    return settings.artifacts_dir / job["id"] / attempt_id
+
+
+def _relocate_under(path: str | Path, src_root: Path, dst_root: Path) -> str:
+    raw = Path(path)
+    try:
+        rel = raw.resolve().relative_to(src_root.resolve())
+    except (ValueError, OSError):
+        return str(raw)
+    return str(dst_root / rel)
+
+
+def _publish_current(job_id: str, attempt_id: str | None, artifact_dir: Path) -> Path:
+    """Replace artifacts/{job_id}/current with this attempt's dir if it is current."""
+    if not attempt_id:
+        return artifact_dir
+    settings = get_settings()
+    expected = (settings.artifacts_dir / job_id / attempt_id).resolve()
+    try:
+        src = artifact_dir.resolve()
+    except OSError:
+        return artifact_dir
+    if src != expected or not src.is_dir():
+        return artifact_dir
+    job_root = settings.artifacts_dir / job_id
+    current = job_root / "current"
+    staging = job_root / f".staging-{attempt_id}"
+    backup = job_root / f".old-{attempt_id}"
+    if staging.exists():
+        shutil.rmtree(staging)
+    shutil.copytree(src, staging)
+    if backup.exists():
+        shutil.rmtree(backup)
+    if current.exists() or current.is_symlink():
+        current.rename(backup)
+    staging.rename(current)
+    if backup.exists():
+        shutil.rmtree(backup, ignore_errors=True)
+    return current
 
 
 def _build_call(job: dict) -> tuple[dict, dict]:
-    settings = get_settings()
-    artifact_dir = settings.artifacts_dir / job["id"]
+    artifact_dir = _attempt_artifact_dir(job)
     (artifact_dir / "plots").mkdir(parents=True, exist_ok=True)
     progress = {}
     if job.get("progress_json"):
@@ -292,6 +337,16 @@ def _store_train_result(
         if not finish_job(job["id"], status="succeeded", attempt_id=attempt_id, conn=conn):
             conn.rollback()
             return False
+        published = _publish_current(job["id"], attempt_id, artifact_dir)
+        if published.resolve() != artifact_dir.resolve():
+            conn.execute(
+                "UPDATE models SET artifact_path = ? WHERE id = ?",
+                (_relocate_under(model_path, artifact_dir, published), model_id),
+            )
+            conn.execute(
+                "UPDATE reports SET plot_dir = ? WHERE job_id = ?",
+                (str(published / "plots"), job["id"]),
+            )
         return True
 
 
@@ -346,6 +401,19 @@ def _store_predict_result(
         if not finish_job(job["id"], status="succeeded", attempt_id=attempt_id, conn=conn):
             conn.rollback()
             return False
+        published = _publish_current(job["id"], attempt_id, artifact_dir)
+        if published.resolve() != artifact_dir.resolve():
+            conn.execute(
+                """
+                UPDATE predictions SET output_path = ?
+                WHERE id = ?
+                """,
+                (_relocate_under(output_path, artifact_dir, published), pred_id),
+            )
+            conn.execute(
+                "UPDATE reports SET plot_dir = ? WHERE job_id = ?",
+                (str(published / "plots"), job["id"]),
+            )
         return True
 
 
@@ -402,6 +470,9 @@ def _n_test(metrics: dict) -> int | None:
 def _baseline_metrics(metrics: dict) -> dict | None:
     if not isinstance(metrics, dict):
         return None
+    canonical = metrics.get("baseline")
+    if isinstance(canonical, dict) and canonical:
+        return canonical
     candidates = metrics.get("candidates")
     if not isinstance(candidates, dict):
         return None
@@ -494,7 +565,7 @@ def _run_ml_child(
     )
     proc.start()
     child_conn.close()
-    attach_job_process(job_id, proc)
+    attach_job_process(job_id, proc, attempt_id=attempt_id)
 
     def _abandoned() -> bool:
         return job_status(job_id) == "canceled" or not attempt_is_current(job_id, attempt_id)
@@ -530,7 +601,7 @@ def _run_ml_child(
     finally:
         with suppress(BrokenPipeError, EOFError, OSError):
             parent_conn.close()
-        attach_job_process(job_id, None)
+        attach_job_process(job_id, None, attempt_id=attempt_id)
 
 
 def start_worker(*, poll_interval: float = 0.25) -> Worker:

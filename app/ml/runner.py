@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import joblib
@@ -39,6 +40,18 @@ from app.ml.preprocess import (
 )
 
 MODEL_FILENAME = "model.joblib"
+QUICK_BUDGET_S = 60.0
+THOROUGH_BUDGET_S = 300.0
+BASELINE_FAMILY = {"classification": "dummy", "regression": "dummy", "forecast": "last_value"}
+
+
+def budget_seconds(budget: str) -> float:
+    name = (budget or "quick").strip().lower()
+    return THOROUGH_BUDGET_S if name == "thorough" else QUICK_BUDGET_S
+
+
+def _budget_deadline(budget: str) -> float:
+    return time.monotonic() + budget_seconds(budget)
 
 
 def run_train(job: dict, paths: dict) -> dict:
@@ -50,8 +63,9 @@ def run_train(job: dict, paths: dict) -> dict:
     if task not in {"classification", "regression", "forecast"}:
         raise ValueError("config['task'] must be classification, regression, or forecast")
     df = _read_table(job["dataset_normalized_path"], roles=config.get("roles"))
+    deadline = _budget_deadline(config.get("budget") or "quick")
     if task == "forecast":
-        result = forecast.train(df, config, artifact_dir)
+        result = forecast.train(df, config, artifact_dir, deadline=deadline)
         bundle = {
             "task": "forecast",
             "pipeline": None,
@@ -67,7 +81,7 @@ def run_train(job: dict, paths: dict) -> dict:
         }
         return _finalize_train(result, bundle, artifact_dir)
 
-    result = _train_supervised(df, config, artifact_dir, task)
+    result = _train_supervised(df, config, artifact_dir, task, deadline=deadline)
     bundle = {
         "task": task,
         "pipeline": result.pop("pipeline"),
@@ -231,7 +245,13 @@ def _read_table(path, *, roles=None, feature_spec=None) -> pd.DataFrame:
     return df
 
 
-def _train_supervised(df: pd.DataFrame, config: dict, artifact_dir: Path, task: str) -> dict:
+def _train_supervised(
+    df: pd.DataFrame,
+    config: dict,
+    artifact_dir: Path,
+    task: str,
+    deadline: float | None = None,
+) -> dict:
     target = config.get("target")
     if not target:
         raise ValueError("config['target'] is required")
@@ -275,12 +295,15 @@ def _train_supervised(df: pd.DataFrame, config: dict, artifact_dir: Path, task: 
         raise RuntimeError("Train/test split leaked")
 
     budget = config.get("budget") or "quick"
+    if deadline is None:
+        deadline = _budget_deadline(budget)
     if task == "classification":
         candidates = classify.iter_candidates(budget, seed)
         scoring = "f1_macro"
     else:
         candidates = regress.iter_candidates(budget, seed)
         scoring = "neg_mean_absolute_error"
+    baseline_family = BASELINE_FAMILY[task]
 
     if task == "classification" and not classify.HAS_XGBOOST or task == "regression" and not regress.HAS_XGBOOST:
         xgb_missing = True
@@ -297,12 +320,20 @@ def _train_supervised(df: pd.DataFrame, config: dict, artifact_dir: Path, task: 
         failures.append({"candidate": "xgboost", "error": "xgboost unavailable"})
 
     family_best: dict[str, dict] = {}
+    skipped_families: set[str] = set()
     thorough = budget == "thorough"
     cv = None
     if thorough:
         cv = _make_cv(task, mode, y[train_all], groups[train_all] if groups is not None else None, seed)
 
+    budget_warned = False
     for cand in candidates:
+        if cand.family != baseline_family and time.monotonic() >= deadline:
+            skipped_families.add(cand.family)
+            if not budget_warned:
+                warnings.append("time budget exhausted; skipped remaining candidates")
+                budget_warned = True
+            continue
         try:
             pipe = Pipeline(
                 [
@@ -310,6 +341,7 @@ def _train_supervised(df: pd.DataFrame, config: dict, artifact_dir: Path, task: 
                     ("model", clone(cand.estimator)),
                 ]
             )
+            val_metrics = None
             if thorough and cv is not None:
                 groups_cv = groups[train_all] if mode == "group" and groups is not None else None
                 scores = cross_val_score(
@@ -325,7 +357,8 @@ def _train_supervised(df: pd.DataFrame, config: dict, artifact_dir: Path, task: 
             else:
                 pipe.fit(X.iloc[train_fit], y[train_fit])
                 pred_val = pipe.predict(X.iloc[val_idx])
-                val_score = _score(task, y[val_idx], pred_val)
+                val_metrics = _task_metrics(task, y[val_idx], pred_val)
+                val_score = _score_from_metrics(task, val_metrics)
             current = family_best.get(cand.family)
             if current is None or val_score > current["val_score"]:
                 family_best[cand.family] = {
@@ -333,16 +366,27 @@ def _train_supervised(df: pd.DataFrame, config: dict, artifact_dir: Path, task: 
                     "candidate": cand,
                     "status": "ok",
                     "params": cand.params,
+                    "val_metrics": val_metrics,
                 }
         except Exception as exc:  # noqa: BLE001
             failures.append({"candidate": cand.name, "error": str(exc)})
             warnings.append(f"candidate {cand.name} failed: {exc}")
 
     if not family_best:
+        if skipped_families:
+            raise ValueError("time budget exhausted before any candidate finished")
         raise ValueError(f"All candidates failed: {failures}")
 
     selected_family = max(family_best, key=lambda fam: family_best[fam]["val_score"])
     selected = family_best[selected_family]["candidate"]
+    if selected_family != baseline_family and time.monotonic() >= deadline:
+        if baseline_family in family_best:
+            warnings.append("time budget exhausted; skipping long final fit")
+            selected_family = baseline_family
+            selected = family_best[baseline_family]["candidate"]
+        else:
+            raise ValueError("time budget exhausted before final fit")
+
     final_pipe = Pipeline(
         [
             ("preprocess", build_preprocessor(spec, scale_numeric=selected.scale_numeric)),
@@ -351,16 +395,30 @@ def _train_supervised(df: pd.DataFrame, config: dict, artifact_dir: Path, task: 
     )
     final_pipe.fit(X.iloc[train_all], y[train_all])
     y_pred_raw = final_pipe.predict(X.iloc[test_idx])
+    test_metrics = _task_metrics(task, y[test_idx], y_pred_raw)
     if task == "classification":
         y_true = np.asarray(y[test_idx]).astype(str)
         y_pred = np.asarray(y_pred_raw).astype(str)
-        test_metrics = classification_metrics(y_true, y_pred)
         labels = test_metrics["labels"]
     else:
         y_true = np.asarray(y[test_idx], dtype=float)
         y_pred = np.asarray(y_pred_raw, dtype=float)
-        test_metrics = regression_metrics(y_true, y_pred)
         labels = None
+
+    dummy_test = test_metrics if selected_family == baseline_family else None
+    report_families = {selected_family, baseline_family}
+    for fam in report_families:
+        info = family_best.get(fam)
+        if info is None:
+            continue
+        if info.get("val_metrics") is None:
+            _, _, info["val_metrics"] = _fit_predict_metrics(
+                info["candidate"], spec, X, y, train_fit, val_idx, task
+            )
+        if fam == baseline_family and dummy_test is None:
+            _, _, dummy_test = _fit_predict_metrics(
+                info["candidate"], spec, X, y, train_all, test_idx, task
+            )
 
     plots_dir = Path(artifact_dir) / "plots"
     plot_files: list[str] = []
@@ -383,19 +441,39 @@ def _train_supervised(df: pd.DataFrame, config: dict, artifact_dir: Path, task: 
     except Exception as exc:  # noqa: BLE001
         warnings.append(f"feature importance plot skipped: {exc}")
 
-    candidates_out = {
-        fam: {
+    selected_val = _canonical_split_bag(
+        task, family_best[selected_family].get("val_metrics")
+    )
+    dummy_val = None
+    dummy_test_bag = None
+    if baseline_family in family_best:
+        dummy_val = _canonical_split_bag(task, family_best[baseline_family].get("val_metrics"))
+        dummy_test_bag = _canonical_split_bag(task, dummy_test)
+
+    candidates_out = {}
+    for fam, info in family_best.items():
+        entry = {
             "val_score": info["val_score"],
             "status": "ok",
             "params": info["params"],
             "name": info["candidate"].name,
         }
-        for fam, info in family_best.items()
-    }
+        val_bag = _canonical_split_bag(task, info.get("val_metrics"))
+        if val_bag:
+            entry["validation"] = val_bag
+        if fam == selected_family:
+            entry["test"] = _canonical_split_bag(task, test_metrics)
+        elif fam == baseline_family and dummy_test_bag:
+            entry["test"] = dummy_test_bag
+        candidates_out[fam] = entry
     for fail in failures:
         candidates_out.setdefault(
             fail["candidate"].split("_")[0],
             {"status": "failed", "error": fail["error"]},
+        )
+    for family in skipped_families:
+        candidates_out.setdefault(
+            family, {"status": "skipped", "error": "time budget exhausted"}
         )
     for family in ("dummy", "linear", "xgboost"):
         if family in candidates_out:
@@ -410,26 +488,31 @@ def _train_supervised(df: pd.DataFrame, config: dict, artifact_dir: Path, task: 
         )
         candidates_out[family] = {"status": "failed", "error": err}
 
-    metrics = jsonable(
-        {
-            "task": task,
-            "seed": seed,
-            "selected_candidate": selected_family,
-            "test": test_metrics,
-            "validation": {"score": family_best[selected_family]["val_score"]},
-            "candidates": candidates_out,
-            "candidate_failures": failures,
-            "y_true": y_true.tolist(),
-            "y_pred": y_pred.tolist(),
-            "split_indices": {
-                "train": train_all.tolist(),
-                "val": val_idx.tolist(),
-                "test": test_idx.tolist(),
-            },
-            "library_versions": library_versions(),
-            "params": selected.params,
+    metrics_payload = {
+        "task": task,
+        "seed": seed,
+        "selected_candidate": selected_family,
+        "test": test_metrics,
+        "validation": selected_val,
+        "candidates": candidates_out,
+        "candidate_failures": failures,
+        "y_true": y_true.tolist(),
+        "y_pred": y_pred.tolist(),
+        "split_indices": {
+            "train": train_all.tolist(),
+            "val": val_idx.tolist(),
+            "test": test_idx.tolist(),
+        },
+        "library_versions": library_versions(),
+        "params": selected.params,
+    }
+    if dummy_val is not None and dummy_test_bag is not None:
+        metrics_payload["baseline"] = {
+            "family": baseline_family,
+            "test": dummy_test_bag,
+            "validation": dummy_val,
         }
-    )
+    metrics = jsonable(metrics_payload)
     label_list = sorted(set(y.astype(str).tolist())) if task == "classification" else None
     return {
         "metrics": metrics,
@@ -445,10 +528,39 @@ def _train_supervised(df: pd.DataFrame, config: dict, artifact_dir: Path, task: 
     }
 
 
-def _score(task: str, y_true, y_pred) -> float:
+def _task_metrics(task: str, y_true, y_pred) -> dict:
     if task == "classification":
-        return float(classification_metrics(y_true, y_pred)["macro_f1"])
-    return float(-regression_metrics(y_true, y_pred)["mae"])
+        return classification_metrics(
+            np.asarray(y_true).astype(str), np.asarray(y_pred).astype(str)
+        )
+    return regression_metrics(
+        np.asarray(y_true, dtype=float), np.asarray(y_pred, dtype=float)
+    )
+
+
+def _canonical_split_bag(task: str, metrics: dict | None) -> dict:
+    if not metrics:
+        return {}
+    keys = ("macro_f1", "balanced_accuracy") if task == "classification" else ("mae", "rmse", "r2")
+    return {key: metrics.get(key) for key in keys}
+
+
+def _score_from_metrics(task: str, metrics: dict) -> float:
+    if task == "classification":
+        return float(metrics["macro_f1"])
+    return float(-metrics["mae"])
+
+
+def _fit_predict_metrics(cand, spec, X, y, fit_idx, pred_idx, task: str):
+    pipe = Pipeline(
+        [
+            ("preprocess", build_preprocessor(spec, scale_numeric=cand.scale_numeric)),
+            ("model", clone(cand.estimator)),
+        ]
+    )
+    pipe.fit(X.iloc[fit_idx], y[fit_idx])
+    pred = pipe.predict(X.iloc[pred_idx])
+    return pipe, pred, _task_metrics(task, y[pred_idx], pred)
 
 
 def _make_cv(task: str, mode: str, y_train, groups_train, seed: int):

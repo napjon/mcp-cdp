@@ -97,11 +97,6 @@ export function DataCard({
     headerRow: number
     preview: PreviewTable
   } | null>(null)
-  useEffect(() => {
-    setPendingSheet(null)
-    setSheetError(null)
-  }, [dataset?.id])
-
   const storedHeader = dataset?.current_version?.header_row ?? dataset?.version?.header_row
   const headerRow =
     headerDraft && headerDraft.datasetId === (dataset?.id ?? null)
@@ -111,7 +106,7 @@ export function DataCard({
         : 0
 
   function takeFile(file: File | undefined) {
-    if (!file) return
+    if (!file || busy || sheetBusy) return
     onUpload(file)
   }
 
@@ -165,16 +160,17 @@ export function DataCard({
         className={`dropzone${active ? ' active' : ''}`}
         onDragEnter={(event) => {
           event.preventDefault()
-          setActive(true)
+          if (!formBusy) setActive(true)
         }}
         onDragOver={(event) => {
           event.preventDefault()
-          setActive(true)
+          if (!formBusy) setActive(true)
         }}
         onDragLeave={() => setActive(false)}
         onDrop={(event) => {
           event.preventDefault()
           setActive(false)
+          if (formBusy) return
           takeFile(event.dataTransfer.files[0])
         }}
       >
@@ -187,6 +183,7 @@ export function DataCard({
             className="sr-only"
             type="file"
             accept=".csv,text/csv"
+            disabled={formBusy}
             onChange={(event) => {
               takeFile(event.target.files?.[0])
               event.target.value = ''
@@ -328,7 +325,7 @@ export function DataCard({
       ) : null}
 
       {dataset ? (
-        <DisclosurePanel projectId={projectId} datasetId={dataset.id} />
+        <DisclosurePanel key={`${projectId}:${dataset.id}`} projectId={projectId} datasetId={dataset.id} />
       ) : null}
     </>
   )
@@ -338,57 +335,63 @@ function DisclosurePanel({ projectId, datasetId }: { projectId: string; datasetI
   const [hidden, setHidden] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [enabled, setEnabled] = useState(false)
+  const [enabled, setEnabled] = useState<boolean | null>(null)
   const [sample, setSample] = useState<PreviewTable | null>(null)
   const [previewed, setPreviewed] = useState(false)
+  const genRef = useRef(0)
 
-  useEffect(() => {
-    setHidden(false)
-    setError(null)
-    setEnabled(false)
-    setSample(null)
-    setPreviewed(false)
-  }, [projectId, datasetId])
+  useEffect(
+    () => () => {
+      genRef.current += 1
+    },
+    [],
+  )
 
   if (hidden || !projectId || !datasetId) return null
 
   async function onPreview() {
+    const gen = ++genRef.current
     setBusy(true)
     setError(null)
     try {
       const result = await previewDisclosure(projectId, datasetId)
+      if (gen !== genRef.current) return
       setSample(result.preview)
       setPreviewed(true)
-      setEnabled(result.disclosure.enabled)
+      setEnabled((current) => result.disclosure.enabled ?? current)
     } catch (err) {
+      if (gen !== genRef.current) return
       if (isNotFound(err)) {
         setHidden(true)
         return
       }
       setError(plainError(err))
     } finally {
-      setBusy(false)
+      if (gen === genRef.current) setBusy(false)
     }
   }
 
   async function onSetEnabled(next: boolean) {
+    const gen = ++genRef.current
     setBusy(true)
     setError(null)
     try {
       const result = await putDisclosure(projectId, datasetId, next)
+      if (gen !== genRef.current) return
       if (result.error && result.ok === false) {
         setError(result.error)
         return
       }
       setEnabled(result.enabled)
     } catch (err) {
+      if (gen !== genRef.current) return
       if (isNotFound(err)) {
         setHidden(true)
         return
       }
       setError(plainError(err))
     } finally {
-      setBusy(false)
+      if (gen === genRef.current) setBusy(false)
     }
   }
 
@@ -407,7 +410,7 @@ function DisclosurePanel({ projectId, datasetId }: { projectId: string; datasetI
             <button
               type="button"
               className="ghost"
-              disabled={busy || enabled}
+              disabled={busy || enabled === true}
               onClick={() => void onSetEnabled(true)}
             >
               Enable
@@ -415,7 +418,7 @@ function DisclosurePanel({ projectId, datasetId }: { projectId: string; datasetI
             <button
               type="button"
               className="ghost"
-              disabled={busy || !enabled}
+              disabled={busy || enabled === false}
               onClick={() => void onSetEnabled(false)}
             >
               Disable
@@ -433,11 +436,17 @@ function DisclosurePanel({ projectId, datasetId }: { projectId: string; datasetI
           {error}
         </p>
       ) : null}
-      {previewed && enabled ? (
+      {previewed && enabled === true ? (
         <p className="caption">Sample sharing is on for this spreadsheet.</p>
       ) : null}
-      {previewed && !enabled ? (
+      {previewed && enabled === false ? (
         <p className="caption">Sample sharing is off. Chat will not receive these rows.</p>
+      ) : null}
+      {previewed && enabled == null ? (
+        <p className="caption">
+          The server did not return the current sharing status. Choose Disable to ensure sharing is
+          off, or Enable to allow this sample.
+        </p>
       ) : null}
       {sample && sample.rows.length > 0 ? (
         <SampleTable preview={sample} label="Sample that chat would receive" />

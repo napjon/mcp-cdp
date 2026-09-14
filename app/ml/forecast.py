@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import numpy as np
@@ -260,12 +261,24 @@ def _train_origins(n: int, horizon: int, n_origins: int, min_origin: int = 2) ->
     return origins
 
 
-def _origin_scores(history: pd.Series, horizon: int, season: int, n_origins: int) -> dict[str, float]:
+def _origin_scores(history: pd.Series, horizon: int, season: int, n_origins: int) -> dict:
     n = len(history)
     train_end = n - horizon
     scores = {"last_value": [], "seasonal_naive": []}
+    pairs = {
+        "last_value": {"y_true": [], "y_pred": []},
+        "seasonal_naive": {"y_true": [], "y_pred": []},
+    }
+    empty = {
+        "last_value": np.nan,
+        "seasonal_naive": np.nan,
+        "last_value_y_true": [],
+        "last_value_y_pred": [],
+        "seasonal_naive_y_true": [],
+        "seasonal_naive_y_pred": [],
+    }
     if train_end < 2:
-        return {"last_value": np.nan, "seasonal_naive": np.nan}
+        return empty
     origins = _train_origins(n, horizon, n_origins)
     if not origins:
         origins = [max(1, train_end - 1)]
@@ -280,12 +293,19 @@ def _origin_scores(history: pd.Series, horizon: int, season: int, n_origins: int
         y_true = actual.to_numpy(dtype=float)[mask]
         lv = last_value_forecast(hist, len(actual))[mask]
         scores["last_value"].append(float(np.mean(np.abs(y_true - lv))))
+        pairs["last_value"]["y_true"].extend(y_true.tolist())
+        pairs["last_value"]["y_pred"].extend(lv.tolist())
         if enough_season:
             sn = seasonal_naive_forecast(hist, len(actual), season)[mask]
             scores["seasonal_naive"].append(float(np.mean(np.abs(y_true - sn))))
-    return {
-        name: (float(np.mean(vals)) if vals else np.nan) for name, vals in scores.items()
-    }
+            pairs["seasonal_naive"]["y_true"].extend(y_true.tolist())
+            pairs["seasonal_naive"]["y_pred"].extend(sn.tolist())
+    out = {name: (float(np.mean(vals)) if vals else np.nan) for name, vals in scores.items()}
+    out["last_value_y_true"] = pairs["last_value"]["y_true"]
+    out["last_value_y_pred"] = pairs["last_value"]["y_pred"]
+    out["seasonal_naive_y_true"] = pairs["seasonal_naive"]["y_true"]
+    out["seasonal_naive_y_pred"] = pairs["seasonal_naive"]["y_pred"]
+    return out
 
 
 def _xgb_feature_frame(
@@ -396,7 +416,18 @@ def _recursive_xgb(
     return np.asarray(preds, dtype=float)
 
 
-def train(df: pd.DataFrame, config: dict, artifact_dir: Path) -> dict:
+def _regression_bag(y_true, y_pred, mae_fallback=None) -> dict | None:
+    if y_true and y_pred and len(y_true) == len(y_pred):
+        metrics = regression_metrics(y_true, y_pred)
+        return {"mae": metrics["mae"], "rmse": metrics["rmse"], "r2": metrics["r2"]}
+    if mae_fallback is None:
+        return None
+    return {"mae": mae_fallback, "rmse": None, "r2": None}
+
+
+def train(
+    df: pd.DataFrame, config: dict, artifact_dir: Path, deadline: float | None = None
+) -> dict:
     warnings: list[str] = []
     prepared, meta = _prepare_frame(df, config)
     target = meta["target"]
@@ -408,6 +439,8 @@ def train(df: pd.DataFrame, config: dict, artifact_dir: Path) -> dict:
     seed = int(config.get("seed", 42))
     budget = config.get("budget") or "quick"
     n_origins = 2 if budget != "thorough" else 4
+    if deadline is None:
+        deadline = time.monotonic() + (300.0 if budget == "thorough" else 60.0)
 
     keys = series_keys(prepared, group_columns)
     groups_excluded: list[str] = []
@@ -457,6 +490,12 @@ def train(df: pd.DataFrame, config: dict, artifact_dir: Path) -> dict:
         "xgboost": [],
     }
     candidate_failures: list[dict] = []
+    lv_val_true: list[float] = []
+    lv_val_pred: list[float] = []
+    sn_val_true: list[float] = []
+    sn_val_pred: list[float] = []
+    xgb_val_true: list[float] = []
+    xgb_val_pred: list[float] = []
     seasonal_ok = any(
         int(s.iloc[: max(len(s) - horizon, 0)].dropna().shape[0]) > season
         for s in series_map.values()
@@ -466,8 +505,12 @@ def train(df: pd.DataFrame, config: dict, artifact_dir: Path) -> dict:
         sc = _origin_scores(ser, horizon, season, n_origins)
         if not np.isnan(sc["last_value"]):
             family_scores["last_value"].append(sc["last_value"])
+            lv_val_true.extend(sc["last_value_y_true"])
+            lv_val_pred.extend(sc["last_value_y_pred"])
         if seasonal_ok and not np.isnan(sc["seasonal_naive"]):
             family_scores["seasonal_naive"].append(sc["seasonal_naive"])
+            sn_val_true.extend(sc["seasonal_naive_y_true"])
+            sn_val_pred.extend(sc["seasonal_naive_y_pred"])
 
     if not family_scores["last_value"]:
         family_scores["last_value"] = [float("inf")]
@@ -488,13 +531,21 @@ def train(df: pd.DataFrame, config: dict, artifact_dir: Path) -> dict:
             part[col] = np.nan
         return part
 
-    if HAS_XGBOOST:
+    if HAS_XGBOOST and time.monotonic() >= deadline:
+        candidate_failures.append({"candidate": "xgboost", "error": "time budget exhausted"})
+        warnings.append("time budget exhausted; skipped remaining candidates")
+    elif HAS_XGBOOST:
         try:
             xgb_mae: list[float] = []
             min_origin = 1 + max(lags + [1])
+            xgb_timed_out = False
             for origin in _train_origins(
                 min(len(s) for s in series_map.values()), horizon, n_origins, min_origin
             ):
+                if time.monotonic() >= deadline:
+                    xgb_timed_out = True
+                    warnings.append("time budget exhausted; skipped remaining candidates")
+                    break
                 parts = [_frame_prefix(key, ser, origin) for key, ser in series_map.items()]
                 train_df = pd.concat(parts, ignore_index=True)
                 train_df = train_df.sort_values(group_columns + [date_column]).reset_index(drop=True)
@@ -532,38 +583,48 @@ def train(df: pd.DataFrame, config: dict, artifact_dir: Path) -> dict:
                         extra_columns=extra_columns,
                         extra_future=None,
                     )
-                    xgb_mae.append(
-                        float(np.mean(np.abs(actual.to_numpy(dtype=float)[mask] - pred[mask])))
-                    )
-            train_parts = [
-                _frame_prefix(key, ser, len(ser) - horizon) for key, ser in series_map.items()
-            ]
-            train_df = pd.concat(train_parts, ignore_index=True)
-            train_df = train_df.sort_values(group_columns + [date_column]).reset_index(drop=True)
-            X_all, y_all = _xgb_feature_frame(
-                train_df,
-                target=target,
-                date_column=date_column,
-                group_columns=group_columns,
-                lags=lags,
-                rolls=rolls,
-                frequency=frequency,
-                group_id_map=group_id_map,
-                extra_columns=extra_columns,
-            )
-            xgb_model = _fit_xgb(X_all, y_all, seed, budget)
-            if xgb_model is not None:
-                xgb_feature_names = list(X_all.columns)
-            if xgb_mae:
-                family_scores["xgboost"] = xgb_mae
-            elif xgb_model is None:
+                    y_act = actual.to_numpy(dtype=float)[mask]
+                    y_hat = pred[mask]
+                    xgb_mae.append(float(np.mean(np.abs(y_act - y_hat))))
+                    xgb_val_true.extend(y_act.tolist())
+                    xgb_val_pred.extend(y_hat.tolist())
+            if xgb_timed_out or time.monotonic() >= deadline:
+                xgb_model = None
                 candidate_failures.append(
-                    {"candidate": "xgboost", "error": "insufficient rows after lag features"}
+                    {"candidate": "xgboost", "error": "time budget exhausted"}
                 )
             else:
-                candidate_failures.append(
-                    {"candidate": "xgboost", "error": "no backtest origins"}
+                train_parts = [
+                    _frame_prefix(key, ser, len(ser) - horizon) for key, ser in series_map.items()
+                ]
+                train_df = pd.concat(train_parts, ignore_index=True)
+                train_df = train_df.sort_values(group_columns + [date_column]).reset_index(
+                    drop=True
                 )
+                X_all, y_all = _xgb_feature_frame(
+                    train_df,
+                    target=target,
+                    date_column=date_column,
+                    group_columns=group_columns,
+                    lags=lags,
+                    rolls=rolls,
+                    frequency=frequency,
+                    group_id_map=group_id_map,
+                    extra_columns=extra_columns,
+                )
+                xgb_model = _fit_xgb(X_all, y_all, seed, budget)
+                if xgb_model is not None:
+                    xgb_feature_names = list(X_all.columns)
+                if xgb_mae:
+                    family_scores["xgboost"] = xgb_mae
+                elif xgb_model is None:
+                    candidate_failures.append(
+                        {"candidate": "xgboost", "error": "insufficient rows after lag features"}
+                    )
+                else:
+                    candidate_failures.append(
+                        {"candidate": "xgboost", "error": "no backtest origins"}
+                    )
         except Exception as exc:  # noqa: BLE001
             candidate_failures.append({"candidate": "xgboost", "error": str(exc)})
             xgb_model = None
@@ -588,10 +649,17 @@ def train(df: pd.DataFrame, config: dict, artifact_dir: Path) -> dict:
         raise ValueError("All forecast candidates failed")
 
     selected = min(val_mae, key=val_mae.get)
+    if selected == "xgboost" and (xgb_model is None or time.monotonic() >= deadline):
+        if "last_value" not in val_mae:
+            raise ValueError("time budget exhausted before final fit")
+        warnings.append("time budget exhausted; skipping long final fit")
+        selected = "last_value"
     y_true: list[float] = []
     y_pred: list[float] = []
     y_group: list[str] = []
     y_date: list[str] = []
+    lv_test_true: list[float] = []
+    lv_test_pred: list[float] = []
     plot_dates = []
     plot_true = []
     plot_pred = []
@@ -600,8 +668,9 @@ def train(df: pd.DataFrame, config: dict, artifact_dir: Path) -> dict:
         n = len(ser)
         hist = ser.iloc[: n - horizon]
         actual = ser.iloc[n - horizon :]
+        lv_hat = last_value_forecast(hist, horizon)
         if selected == "last_value":
-            pred = last_value_forecast(hist, horizon)
+            pred = lv_hat
         elif selected == "seasonal_naive":
             pred = seasonal_naive_forecast(hist, horizon, season)
         else:
@@ -628,8 +697,11 @@ def train(df: pd.DataFrame, config: dict, artifact_dir: Path) -> dict:
         mask = actual.notna().to_numpy()
         if not mask.any():
             continue
-        y_true.extend(actual.to_numpy(dtype=float)[mask].tolist())
+        actual_vals = actual.to_numpy(dtype=float)[mask]
+        y_true.extend(actual_vals.tolist())
         y_pred.extend(pred[mask].tolist())
+        lv_test_true.extend(actual_vals.tolist())
+        lv_test_pred.extend(lv_hat[mask].tolist())
         y_group.extend([key] * int(mask.sum()))
         y_date.extend([pd.Timestamp(d).strftime("%Y-%m-%d") for d in actual.index[mask]])
         if len(plot_true) < int(mask.sum()):
@@ -684,32 +756,69 @@ def train(df: pd.DataFrame, config: dict, artifact_dir: Path) -> dict:
         "seed": seed,
     }
 
+    val_bags = {
+        "last_value": _regression_bag(lv_val_true, lv_val_pred, val_mae.get("last_value")),
+        "seasonal_naive": _regression_bag(sn_val_true, sn_val_pred, val_mae.get("seasonal_naive")),
+        "xgboost": _regression_bag(xgb_val_true, xgb_val_pred, val_mae.get("xgboost")),
+    }
+    lv_test_bag = _regression_bag(lv_test_true, lv_test_pred)
+    if selected == "last_value":
+        lv_test_bag = {
+            "mae": test_metrics["mae"],
+            "rmse": test_metrics["rmse"],
+            "r2": test_metrics["r2"],
+        }
+    selected_val = val_bags.get(selected) or {
+        "mae": val_mae.get(selected),
+        "rmse": None,
+        "r2": None,
+    }
+
     candidates_out = {}
     for family, mae in val_mae.items():
-        candidates_out[family] = {"val_mae": mae, "status": "ok"}
+        entry = {"val_mae": mae, "status": "ok"}
+        if val_bags.get(family):
+            entry["validation"] = val_bags[family]
+        if family == selected:
+            entry["test"] = {
+                "mae": test_metrics["mae"],
+                "rmse": test_metrics["rmse"],
+                "r2": test_metrics["r2"],
+            }
+        elif family == "last_value" and lv_test_bag:
+            entry["test"] = lv_test_bag
+        candidates_out[family] = entry
     for fail in candidate_failures:
-        candidates_out.setdefault(fail["candidate"], {"status": "failed", "error": fail["error"]})
+        status = "skipped" if fail["error"] == "time budget exhausted" else "failed"
+        candidates_out.setdefault(
+            fail["candidate"], {"status": status, "error": fail["error"]}
+        )
 
-    metrics = jsonable(
-        {
-            "task": "forecast",
-            "seed": seed,
-            "selected_candidate": selected,
-            "test": test_metrics,
-            "validation": {"mae": val_mae.get(selected)},
-            "candidates": candidates_out,
-            "candidate_failures": candidate_failures,
-            "y_true": y_true,
-            "y_pred": y_pred,
-            "y_group": y_group,
-            "y_date": y_date,
-            "groups_excluded": groups_excluded,
-            "missing_periods": {k: v[:20] for k, v in missing_periods.items()},
-            "missing_period_counts": {k: len(v) for k, v in missing_periods.items()},
-            "library_versions": library_versions(),
-            "params": {"horizon": horizon, "frequency": frequency, "budget": budget},
+    metrics_payload = {
+        "task": "forecast",
+        "seed": seed,
+        "selected_candidate": selected,
+        "test": test_metrics,
+        "validation": selected_val,
+        "candidates": candidates_out,
+        "candidate_failures": candidate_failures,
+        "y_true": y_true,
+        "y_pred": y_pred,
+        "y_group": y_group,
+        "y_date": y_date,
+        "groups_excluded": groups_excluded,
+        "missing_periods": {k: v[:20] for k, v in missing_periods.items()},
+        "missing_period_counts": {k: len(v) for k, v in missing_periods.items()},
+        "library_versions": library_versions(),
+        "params": {"horizon": horizon, "frequency": frequency, "budget": budget},
+    }
+    if lv_test_bag and val_bags.get("last_value"):
+        metrics_payload["baseline"] = {
+            "family": "last_value",
+            "test": lv_test_bag,
+            "validation": val_bags["last_value"],
         }
-    )
+    metrics = jsonable(metrics_payload)
     return {
         "metrics": metrics,
         "warnings": warnings,

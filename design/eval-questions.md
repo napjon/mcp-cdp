@@ -26,9 +26,13 @@ Every row starts as **Not verified**, **Evidence** empty. Keyed 1–100.
 
 Automated tests: 71 passed (`pytest`). Playwright walkthrough on `http://127.0.0.1:5173` completed CSV upload → classify `survived` → train → report (macro-F1 / balanced accuracy / confusion matrix / importance) → score another CSV → download. Chat notice shown with no LLM key; no page JS errors. These observations do **not** flip rows to Pass by themselves except where a row below is updated. XGBoost did not load on this Apple Silicon machine (Intel Homebrew `libomp`); linear was selected. Live Codex/Claude Desktop MCP sessions were not exercised. The original 44-item fieldbook artifact remains missing.
 
-### Implementation snapshot (2026-09-14)
+### Superseded implementation snapshot (2026-09-14)
 
-Codex session `01a09b78-c0b4-7053-a491-7b0d7fff6d8c` is still the plan source. Swarm audit of Q1–100 then a CONTRACT-aligned fix wave. `pytest` **111 passed**. Frontend `tsc -b` passed. Live API on 8765: missing Sheets gid returns `gid_unspecified`; empty CSV upload is rejected. Still **HUMAN_ONLY**: Q3, Q6, Q31, Q81, Q100. Still **MISSING / not in this wave**: Q95 backup/restore/delete/retention; Q98 40-case assistant eval harness; Q99 recorded laptop benchmark. Rows below stay Not verified until evidence is written per question.
+This snapshot records the state before the current fix wave. Its 111-test count and missing lifecycle items are superseded by the current snapshot below. Rows remain Not verified until evidence is written per question.
+
+### Implementation snapshot (2026-09-14, current tree)
+
+Measured this wave (do not treat as Pass evidence for the table below): `.venv/bin/pytest -q -p no:cacheprovider` → **157 passed**. `.venv/bin/ruff check app tests` → clean. `cd frontend && npm run typecheck` passed. `cd frontend && npm run test` → **11 passed**. After `npm ci`, frontend build and lint both pass. CONTRACT lists disclosure routes. Backup archives SQLite plus datasets/artifacts and retention runs on startup and on a maintenance loop. Still **HUMAN_ONLY**: Q3, Q6, Q31, Q81, Q100. Still **MISSING**: Q98 40-case assistant eval harness and Q99 laptop benchmark. Rows below stay Not verified until evidence is written per question.
 
 ### 1–10 Product completeness and architecture
 

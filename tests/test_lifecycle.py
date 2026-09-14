@@ -180,3 +180,76 @@ def test_delete_project_removes_rows_and_files(client):
             "SELECT 1 FROM dataset_versions WHERE dataset_id = ?", (dataset_id,)
         ).fetchone() is None
         assert conn.execute("SELECT 1 FROM projects WHERE id = 'local'").fetchone()
+
+
+def test_backup_restore_roundtrip_includes_datasets_and_artifacts(db):
+    from pathlib import Path
+
+    from app.lifecycle import backup, restore
+    from app.settings import get_settings
+
+    settings = get_settings()
+    dataset_file = settings.datasets_dir / "ds-keep" / "table.csv"
+    artifact_file = settings.artifacts_dir / "job-keep" / "model.joblib"
+    dataset_file.parent.mkdir(parents=True, exist_ok=True)
+    artifact_file.parent.mkdir(parents=True, exist_ok=True)
+    dataset_file.write_text("a,b\n1,2\n", encoding="utf-8")
+    artifact_file.write_bytes(b"artifact")
+
+    result = backup()
+    archive = Path(result["path"])
+    assert archive.is_file()
+    assert archive.name.endswith(".tar.gz")
+    assert result["manifest"]["db"]
+    assert result["manifest"]["datasets"] == "datasets"
+    assert result["manifest"]["artifacts"] == "artifacts"
+    assert result["manifest"]["created"]
+
+    dataset_file.unlink()
+    artifact_file.unlink()
+    assert not dataset_file.exists()
+    assert not artifact_file.exists()
+
+    restored = restore(archive)
+    assert restored["ok"] is True
+    assert dataset_file.is_file()
+    assert dataset_file.read_text(encoding="utf-8") == "a,b\n1,2\n"
+    assert artifact_file.is_file()
+    assert artifact_file.read_bytes() == b"artifact"
+
+
+def test_maybe_run_retention_startup_hook_and_purge(db):
+    import inspect
+
+    from app.db import get_db
+    from app.lifecycle import maybe_run_retention, purge
+    from app.main import create_app
+
+    assert callable(maybe_run_retention)
+    assert callable(purge)
+    assert "maybe_run_retention" in inspect.getsource(create_app)
+
+    old = "2020-01-01T00:00:00Z"
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO conversations (id, project_id, created_at) VALUES ('c-old', 'local', ?)",
+            (old,),
+        )
+        conn.execute(
+            """
+            INSERT INTO messages (
+              id, conversation_id, role, content, client_id, status, created_at
+            ) VALUES ('m-old', 'c-old', 'user', 'stale', 'cid-old', 'complete', ?)
+            """,
+            (old,),
+        )
+
+    first = purge(days=30)
+    assert first["ok"] is True
+    assert first["conversations_deleted"] == 1
+    assert first["messages_deleted"] >= 1
+    again = maybe_run_retention()
+    assert again["ok"] is True
+    with get_db() as conn:
+        assert conn.execute("SELECT 1 FROM conversations WHERE id = 'c-old'").fetchone() is None
+        assert conn.execute("SELECT 1 FROM messages WHERE id = 'm-old'").fetchone() is None

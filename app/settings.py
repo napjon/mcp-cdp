@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     mcp_token: str | None = None
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
+    # Comma- or path-separator-delimited roots allowed to the stdio MCP importer.
+    mcp_import_roots: str | None = None
 
     @field_validator("host")
     @classmethod

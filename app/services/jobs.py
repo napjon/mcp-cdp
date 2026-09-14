@@ -16,27 +16,50 @@ from app.settings import get_settings
 
 LEASE_SECONDS = 60
 
-_job_processes: dict[str, object] = {}
+# job_id -> (attempt_id, process). attempt_id lets recover kill the stale attempt
+# without terminating a replacement already attached for the same job_id.
+_job_processes: dict[str, tuple[str | None, object]] = {}
 _job_processes_lock = threading.Lock()
 
 
-def attach_job_process(job_id: str, proc: object | None) -> None:
+def attach_job_process(
+    job_id: str, proc: object | None, attempt_id: str | None = None
+) -> None:
     with _job_processes_lock:
         if proc is None:
-            _job_processes.pop(job_id, None)
-        else:
-            _job_processes[job_id] = proc
+            entry = _job_processes.get(job_id)
+            if entry is None:
+                return
+            attached_attempt, _attached_proc = entry
+            if (
+                attempt_id is None
+                or attached_attempt is None
+                or attached_attempt == attempt_id
+            ):
+                _job_processes.pop(job_id, None)
+            return
+        _job_processes[job_id] = (attempt_id, proc)
 
 
-def terminate_job_process(job_id: str) -> None:
+def terminate_job_process(job_id: str, attempt_id: str | None = None) -> None:
     with _job_processes_lock:
-        proc = _job_processes.get(job_id)
+        entry = _job_processes.get(job_id)
+        if entry is None:
+            return
+        attached_attempt, proc = entry
+        if (
+            attempt_id is not None
+            and attached_attempt is not None
+            and attached_attempt != attempt_id
+        ):
+            return
+        _job_processes.pop(job_id, None)
     _terminate_proc(proc)
 
 
 def terminate_all_job_processes() -> None:
     with _job_processes_lock:
-        procs = list(_job_processes.values())
+        procs = [entry[1] for entry in _job_processes.values()]
     for proc in procs:
         _terminate_proc(proc)
 
@@ -51,6 +74,15 @@ def _terminate_proc(proc: object | None) -> None:
         terminate = getattr(proc, "terminate", None)
         if callable(terminate):
             terminate()
+            join = getattr(proc, "join", None)
+            if callable(join):
+                join(timeout=5)
+            is_alive = getattr(proc, "is_alive", None)
+            kill = getattr(proc, "kill", None)
+            if callable(is_alive) and is_alive() and callable(kill):
+                kill()
+                if callable(join):
+                    join(timeout=2)
     except OSError:
         pass
 
@@ -65,22 +97,23 @@ def enqueue_job(
 ) -> dict:
     if job_type not in {"train", "predict"}:
         raise AppError("invalid job type")
+    job_id = new_id()
+    now = utcnow()
+    max_queue = get_settings().max_queue
     with get_db() as conn:
+        # isolation_level None so Python does not emit a second BEGIN around DML.
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
         require_project(conn, project_id)
-        queued = conn.execute(
-            "SELECT COUNT(*) AS c FROM jobs WHERE status = 'queued'"
-        ).fetchone()["c"]
-        if queued >= get_settings().max_queue:
-            raise AppError("job queue is full", status_code=429, code="queue_full")
-        job_id = new_id()
-        now = utcnow()
-        conn.execute(
+        cur = conn.execute(
             """
             INSERT INTO jobs (
               id, project_id, experiment_revision_id, model_id, type, status,
               attempt_id, lease_until, heartbeat_at, progress_json, error,
               created_at, started_at, finished_at
-            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, NULL, ?, NULL, NULL)
+            )
+            SELECT ?, ?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, NULL, ?, NULL, NULL
+            WHERE (SELECT COUNT(*) FROM jobs WHERE status = 'queued') < ?
             """,
             (
                 job_id,
@@ -91,8 +124,11 @@ def enqueue_job(
                 new_id(),
                 json.dumps(progress or {}),
                 now,
+                max_queue,
             ),
         )
+        if cur.rowcount != 1:
+            raise AppError("job queue is full", status_code=429, code="queue_full")
         return get_job(project_id, job_id, conn=conn)
 
 
@@ -297,15 +333,29 @@ def update_progress(job_id: str, progress: dict) -> None:
 
 def recover_stale_jobs() -> None:
     now = utcnow()
+    recovered: list[tuple[str, str | None]] = []
     with get_db() as conn:
-        conn.execute(
+        rows = conn.execute(
             """
-            UPDATE jobs SET status = 'queued', lease_until = NULL, attempt_id = ?
+            SELECT id, attempt_id FROM jobs
             WHERE status = 'running'
               AND (lease_until IS NULL OR lease_until < ?)
             """,
-            (new_id(), now),
-        )
+            (now,),
+        ).fetchall()
+        for row in rows:
+            cur = conn.execute(
+                """
+                UPDATE jobs SET status = 'queued', lease_until = NULL, attempt_id = ?
+                WHERE id = ? AND status = 'running'
+                  AND (lease_until IS NULL OR lease_until < ?)
+                """,
+                (new_id(), row["id"], now),
+            )
+            if cur.rowcount == 1:
+                recovered.append((row["id"], row["attempt_id"]))
+    for job_id, old_attempt in recovered:
+        terminate_job_process(job_id, attempt_id=old_attempt)
 
 
 def get_report(project_id: str, job_id: str) -> dict:

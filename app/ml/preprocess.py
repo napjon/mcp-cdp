@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 
@@ -410,6 +411,77 @@ def _as_token_series(s: pd.Series) -> pd.Series:
     return s.map(_as_token).astype("object")
 
 
+def classification_split_feasible(
+    n_rows,
+    n_classes=None,
+    test_size: float = 0.2,
+    min_support: int = 2,
+) -> bool:
+    """Return whether a stratified train/val/test split can keep min_support.
+
+    Call from experiment creation (`app.services.experiments`) so weak class
+    support is rejected before enqueue. `split_supervised` still raises at train.
+
+    Accepts either:
+    - ``(n_rows, n_classes, test_size, min_support)`` totals, or
+    - ``(counts: dict[str, int], test_size=...)`` per-class counts.
+    """
+    if isinstance(n_rows, dict):
+        counts = n_rows
+        if n_classes is not None:
+            try:
+                maybe = float(n_classes)
+            except (TypeError, ValueError):
+                maybe = None
+            if maybe is not None and 0.0 < maybe < 1.0:
+                test_size = maybe
+        return _classification_split_from_counts(counts, test_size)
+    try:
+        n_rows_i = int(n_rows)
+        n_classes_i = int(n_classes)
+        min_support_i = int(min_support)
+        test_size_f = float(test_size)
+    except (TypeError, ValueError):
+        return False
+    if n_classes_i < 2 or min_support_i < 1 or n_rows_i < 4:
+        return False
+    if not 0.0 < test_size_f < 1.0:
+        return False
+    if n_rows_i < n_classes_i * min_support_i:
+        return False
+    n_test = max(1, math.ceil(test_size_f * n_rows_i))
+    n_train = n_rows_i - n_test
+    if n_test < n_classes_i or n_train < n_classes_i:
+        return False
+    if n_train < n_classes_i * min_support_i:
+        return False
+    if n_train < 3:
+        n_val, n_fit = 1, n_train - 1
+    else:
+        n_val = max(1, math.ceil(0.2 * n_train))
+        n_val = min(n_val, n_train - 1)
+        n_fit = n_train - n_val
+    return n_val >= n_classes_i and n_fit >= n_classes_i
+
+
+def _classification_split_from_counts(counts: dict, test_size: float) -> bool:
+    n = sum(int(c) for c in counts.values())
+    n_classes = len(counts)
+    if n_classes < 2 or n <= 0:
+        return False
+    try:
+        test_size_f = float(test_size)
+    except (TypeError, ValueError):
+        return False
+    if not 0.0 < test_size_f < 1.0:
+        return False
+    n_test = min(n - 1, max(1, math.ceil(test_size_f * n - 1e-12)))
+    for count in counts.values():
+        if (n_test * int(count)) / n < 0.5:
+            return False
+    return True
+
+
 def split_supervised(
     y,
     *,
@@ -440,7 +512,7 @@ def split_supervised(
         if dates is None:
             raise ValueError("time split requires date_column")
         order = np.argsort(np.asarray(pd.to_datetime(dates)))
-        n_test = max(1, int(round(n * test_size)))
+        n_test = max(1, round(n * test_size))
         if n - n_test < 2:
             raise ValueError(
                 f"time split cannot reserve an untouched test partition of "

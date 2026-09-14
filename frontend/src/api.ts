@@ -589,6 +589,10 @@ function normalizeDisclosure(raw: unknown, datasetId: string): SampleDisclosure 
     enabledRaw === 1 ||
     enabledRaw === '1' ||
     enabledRaw === 'true'
+      ? true
+      : enabledRaw === false || enabledRaw === 0 || enabledRaw === '0' || enabledRaw === 'false'
+        ? false
+        : null
   return {
     dataset_id: str(nested.dataset_id) ?? datasetId,
     enabled,
@@ -769,16 +773,26 @@ function nestedDelta(payload: Record<string, unknown>): string | undefined {
   return undefined
 }
 
-async function readSse(
+export type SseOutcome = 'done' | 'error' | 'interrupted'
+export type SseEventResult = 'continue' | SseOutcome
+
+function sseOutcome(result: SseEventResult): SseOutcome | null {
+  if (result === 'continue') return null
+  if (result === 'error') return 'error'
+  if (result === 'interrupted') return 'interrupted'
+  return 'done'
+}
+
+export async function readSse(
   res: Response,
-  onEvent: (data: unknown, event: string | null) => 'continue' | 'done' | 'error' | 'interrupted',
+  onEvent: (data: unknown, event: string | null) => SseEventResult,
   signal?: AbortSignal,
-): Promise<'done' | 'error' | 'interrupted'> {
-  if (!res.body) return 'done'
+): Promise<SseOutcome> {
+  if (!res.body) return 'interrupted'
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
   let buf = ''
-  let outcome: 'done' | 'error' | 'interrupted' = 'done'
+  let outcome: SseOutcome = 'interrupted'
 
   const cancel = () => {
     void reader.cancel()
@@ -788,11 +802,13 @@ async function readSse(
   try {
     while (true) {
       if (signal?.aborted) {
-        outcome = 'interrupted'
-        break
+        return 'interrupted'
       }
       const { done, value } = await reader.read()
-      if (done) break
+      if (done) {
+        buf += decoder.decode()
+        break
+      }
       buf += decoder.decode(value, { stream: true })
       buf = buf.replace(/\r\n/g, '\n')
       let sep: number
@@ -801,22 +817,31 @@ async function readSse(
         buf = buf.slice(sep + 2)
         const parsed = parseSseBlock(block)
         if (!parsed) continue
-        const result = onEvent(parsed.data, parsed.event)
-        if (result !== 'continue') {
-          outcome = result === 'error' ? 'error' : result === 'interrupted' ? 'interrupted' : 'done'
+        const next = sseOutcome(onEvent(parsed.data, parsed.event))
+        if (next) {
+          outcome = next
           await reader.cancel()
-          return outcome
+          return signal?.aborted ? 'interrupted' : outcome
         }
       }
     }
+    if (signal?.aborted) return 'interrupted'
     if (buf.trim()) {
       const parsed = parseSseBlock(buf)
-      if (parsed) onEvent(parsed.data, parsed.event)
+      if (parsed) {
+        const next = sseOutcome(onEvent(parsed.data, parsed.event))
+        if (next) outcome = next
+      }
     }
+  } catch (err) {
+    if (signal?.aborted || (err instanceof DOMException && err.name === 'AbortError')) {
+      return 'interrupted'
+    }
+    throw err
   } finally {
     signal?.removeEventListener('abort', cancel)
   }
-  return outcome
+  return signal?.aborted ? 'interrupted' : outcome
 }
 
 function parseSseBlock(block: string): { event: string | null; data: unknown } | null {

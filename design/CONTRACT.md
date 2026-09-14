@@ -86,6 +86,8 @@ All mutating routes are CSRF-protected for cookie sessions (SameSite=Lax + origi
 - `GET /api/projects/{id}/datasets`
 - `GET /api/projects/{id}/datasets/{id}` including current version + profile summary
 - `GET /api/projects/{id}/datasets/{id}/preview?n=20`
+- `POST /api/projects/{id}/datasets/{id}/disclosure/preview` records `previewed_at`; returns a bounded sample (≤5 rows). Does not enable sharing.
+- `PUT /api/projects/{id}/datasets/{id}/disclosure` `{enabled:bool}` — enable requires a prior preview; disable applies immediately
 - `PUT /api/projects/{id}/datasets/{id}/columns` `{columns:[{name, role}]}`
 - `POST /api/projects/{id}/experiments` `{dataset_id, config}`
 - `POST /api/projects/{id}/experiments/{id}/submit` → `{job_id, status:"queued"}` immediately
@@ -155,7 +157,7 @@ Stdio bridge: `python -m app.mcp.stdio_bridge` forwards to `http://127.0.0.1:876
 
 User row persisted before generation. Assistant row `streaming` then `complete`/`interrupted`/`failed`.
 Idempotent on `client_id`. Default context: schema, aggregates, experiment settings, computed metrics.
-Raw samples only if `sample_disclosure.enabled`. Max 6 tool calls per turn. Tools call the same services as REST.
+Raw samples only if `sample_disclosure.enabled` after `POST .../disclosure/preview`. Enable/disable is `PUT .../disclosure`. Max 6 tool calls per turn. Tools call the same services as REST. There is no MCP write tool for disclosure.
 If no API key, chat explains that modeling still works from the cards.
 
 ## Google Sheets

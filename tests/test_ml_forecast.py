@@ -269,3 +269,31 @@ def test_predict_rejects_unseen_forecast_groups(tmp_path: Path):
             },
             {"artifact_dir": str(art)},
         )
+
+
+def test_forecast_last_value_nested_metric_bags(tmp_path: Path):
+    csv_path = tmp_path / "fc.csv"
+    _daily_frame().to_csv(csv_path, index=False)
+    result = run_train(_job(csv_path), {"artifact_dir": str(tmp_path / "art")})
+    metrics = result["metrics"]
+    keys = ("mae", "rmse", "r2")
+    lv = metrics["candidates"]["last_value"]
+    selected = metrics["candidates"][result["selected_candidate"]]
+    bags = (
+        metrics["test"],
+        metrics["validation"],
+        lv["test"],
+        lv["validation"],
+        selected["test"],
+        selected["validation"],
+    )
+    for bag in bags:
+        for key in keys:
+            assert key in bag
+    baseline = metrics["baseline"]
+    assert baseline["family"] == "last_value"
+    for key in keys:
+        assert key in baseline["test"]
+        assert key in baseline["validation"]
+    if result["selected_candidate"] != "last_value":
+        assert lv["test"] != metrics["validation"]

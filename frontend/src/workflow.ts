@@ -229,7 +229,11 @@ export function reducer(state: AppState, action: Action): AppState {
         ),
       }
     case 'DATA_BUSY':
-      return { ...state, dataBusy: action.busy }
+      return {
+        ...state,
+        dataBusy: action.busy,
+        dataError: action.busy ? null : state.dataError,
+      }
     case 'DATA_ERROR':
       return { ...state, dataError: action.error, dataBusy: false }
     case 'DATA_LOADED': {

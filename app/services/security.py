@@ -75,7 +75,12 @@ def check_mutating_request(request: Request, settings: Settings) -> None:
     if not host_allowed(host):
         raise AppError("invalid host", status_code=403)
     origin = request.headers.get("origin")
-    if origin and not origin_allowed(origin, settings):
+    requested_with = request.headers.get("x-requested-with", "")
+    if origin:
+        if not origin_allowed(origin, settings):
+            raise AppError("invalid origin", status_code=403)
+        return
+    if requested_with != "mcp-cdp":
         raise AppError("invalid origin", status_code=403)
 
 
